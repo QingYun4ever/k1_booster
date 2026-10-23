@@ -3,6 +3,7 @@
 #include <tuple>
 #include <vector>
 #include <string>
+#include <stdexcept>
 #include <behaviortree_cpp/behavior_tree.h>
 #include <behaviortree_cpp/bt_factory.h>
 #include <algorithm>
@@ -10,6 +11,7 @@
 
 #include "types.h"
 #include "formation.h"
+#include "motion_policy.h"
 
 class Brain;
 
@@ -22,14 +24,16 @@ public:
     BrainTree(Brain *argBrain) : brain(argBrain) {}
 
     void init();
+    void halt();
     void tick();
 
     // get entry on blackboard
     template <typename T>
     inline T getEntry(const string &key)
     {
-        T value;
-        [[maybe_unused]] auto res = tree.rootBlackboard()->get<T>(key, value);
+        T value{};
+        auto res = tree.rootBlackboard()->get<T>(key, value);
+        if (!res) throw std::runtime_error("Missing behavior-tree blackboard entry: " + key);
         return value;
     }
 
@@ -48,16 +52,6 @@ private:
 
 // ------------------------------- 比赛用 -------------------------------
 
-// 分析赛场状况
-class Analyze : public SyncActionNode
-{
-public:
-    Analyze(const string &name, const NodeConfig &config, Brain *_brain) : SyncActionNode(name, config), brain(_brain) {}
-    static PortsList providedPorts() { return {}; }
-    NodeStatus tick() override { return NodeStatus::SUCCESS; } 
-private:
-    Brain *brain;
-};
 
 // 计算踢球的角度
 class CalcKickDir : public SyncActionNode 
@@ -90,15 +84,6 @@ private:
     bool _adjustActive = false;     // 当前是否处于连续 adjust 计时中
 };
 
-class NewDecide : public SyncActionNode
-{
-public:
-    NewDecide(const string &name, const NodeConfig &config, Brain *_brain) : SyncActionNode(name, config), brain(_brain) {}
-    static PortsList providedPorts() { return { InputPort<double>("chase_threshold", 1.0, "") }; }
-    NodeStatus tick() override { return NodeStatus::SUCCESS; }
-private:
-    Brain *brain;
-};
 
 class GoalieDecide : public SyncActionNode
 {
@@ -285,9 +270,6 @@ private:
     double _dir = 1.0;
 };
 
-// 补充 Chase 变体定义
-class Chase3 : public SyncActionNode { public: Chase3(const string &n, const NodeConfig &c, Brain *b) : SyncActionNode(n,c), brain(b) {} NodeStatus tick() override { return NodeStatus::SUCCESS; } static PortsList providedPorts() { return {}; } private: Brain *brain; };
-class Chase4 : public SyncActionNode { public: Chase4(const string &n, const NodeConfig &c, Brain *b) : SyncActionNode(n,c), brain(b) {} NodeStatus tick() override { return NodeStatus::SUCCESS; } static PortsList providedPorts() { return {}; } private: Brain *brain; };
 class Chase2 : public StatefulActionNode { public: Chase2(const string &n, const NodeConfig &c, Brain *b) : StatefulActionNode(n,c), brain(b) {} NodeStatus onStart() override { return NodeStatus::SUCCESS; } NodeStatus onRunning() override { return NodeStatus::SUCCESS; } void onHalted() override {} static PortsList providedPorts() { return {}; } private: Brain *brain; };
 
 class Adjust : public SyncActionNode
@@ -384,9 +366,6 @@ public:
 
     void onHalted() override;
 
-    static rclcpp::Time getLastExitTime() { return _lastExitTime; }
-
-    static bool isMinIntervalSatisfied(double minIntervalMsec);
 
 private:
     Brain *brain;
@@ -397,11 +376,10 @@ private:
     bool _visionKickStarted = false;
     bool _pendingRobocupWalk = false;
     rclcpp::Time _decelStartTime;
+    motion_policy::VisualKickProgress _progress;
     double _decelDurationMs = 500.0;
 
-    static rclcpp::Time _lastExitTime;
 
-    void recordExitTime();
     void startDecelerate(double durationMs = 500.0);
     bool stepDecelerate();
 };
@@ -441,9 +419,6 @@ private:
     rclcpp::Time _startTime;
 };
 
-// 守门员动作
-class GoalieSquat : public SyncActionNode { public: GoalieSquat(const string &n, const NodeConfig &c, Brain *b) : SyncActionNode(n,c), brain(b) {} NodeStatus tick() override { return NodeStatus::SUCCESS; } static PortsList providedPorts() { return {}; } private: Brain *brain; };
-class GoalieStandUp : public SyncActionNode { public: GoalieStandUp(const string &n, const NodeConfig &c, Brain *b) : SyncActionNode(n,c), brain(b) {} NodeStatus tick() override { return NodeStatus::SUCCESS; } static PortsList providedPorts() { return {}; } private: Brain *brain; };
 
 class SelfLocate : public SyncActionNode
 {
@@ -662,6 +637,7 @@ public:
     BT::NodeStatus tick() override;
 private:
     Brain *brain;
+    motion_policy::ArrivalLock _arrivalLock;
 };
 
 // 站位槽位节点 (方案任务4): 计算并前往本机的阵型槽位. scene="auto" 按 GC 状态自动选场景.
@@ -687,6 +663,7 @@ private:
     Point2D _frozenBall{0.0, 0.0};
     rclcpp::Time _lastReplanTime;
     FormationResult _current;
+    motion_policy::ArrivalLock _arrivalLock;
 };
 
 class GoToGoalBlockingPosition : public SyncActionNode
@@ -703,6 +680,7 @@ public:
     BT::NodeStatus tick() override;
 private:
     Brain *brain;
+    motion_policy::ArrivalLock _arrivalLock;
 };
 
 class Assist : public SyncActionNode
@@ -759,15 +737,6 @@ private:
     Brain *brain;
 };
 
-class RoleSwitchIfNeeded : public SyncActionNode
-{
-public:
-    RoleSwitchIfNeeded(const std::string &name, const NodeConfig &config, Brain *_brain) : SyncActionNode(name, config), brain(_brain) {}
-    NodeStatus tick() override;
-    static BT::PortsList providedPorts() { return { }; }
-private:
-    Brain *brain;
-};
 
 class WaveHand : public SyncActionNode
 {

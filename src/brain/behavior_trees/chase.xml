@@ -15,7 +15,7 @@
                   <Sequence _while="ball_location_known" >
                      <SimpleChase  stop_dist="1.0" stop_angle="0.3" vx_limit="1.4" vy_limit="0.4" vtheta_limit="2.4" />
                      <PlaySound sound="playful" _while="ball_range>=1.5" />
-                     <PlaySound sound="exited" _while="ball_range<1.0" />
+                     <PlaySound sound="exited" _while="ball_range&lt;1.0" />
                   </Sequence>
                </Sequence>
             </ReactiveSequence>

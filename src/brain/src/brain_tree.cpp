@@ -45,8 +45,6 @@ void BrainTree::init()
     REGISTER_BUILDER(CamLissajousScan)
     REGISTER_BUILDER(CamScanField)
     
-    // 如果cpp里没实现这些类，注释掉，否则链接会报错。
-    // 但在 header 里我给了它们空的 tick 实现，所以这里注册是安全的。
     REGISTER_BUILDER(SelfLocate)
     REGISTER_BUILDER(SelfLocateLine)
     REGISTER_BUILDER(SelfLocateEnterField)
@@ -78,8 +76,6 @@ void BrainTree::init()
     REGISTER_BUILDER(RLVisionKick)
     REGISTER_BUILDER(Intercept)
 
-    // ⚠ RoleSwitchIfNeeded 已注册但未被任何行为树引用; 真正生效的角色切换在 brain.cpp handleCooperation。冗余/历史遗留。
-    REGISTER_BUILDER(RoleSwitchIfNeeded)
 
     REGISTER_BUILDER(Assist)
 
@@ -112,8 +108,15 @@ void BrainTree::initEntry()
 
     // 开球，对方开球时球动了，或到了时间限制时，置为 true，表示我们可以动了。
     setEntry<bool>("gamecontroller_isKickOff", true);
-    setEntry<string>("gc_game_state", "");
+    setEntry<string>("gc_game_state", "INITIAL");
     setEntry<string>("gc_game_sub_state_type", "NONE");
+    setEntry<bool>("gc_play_stopped", true);
+    setEntry<bool>("penalty_kick_active", false);
+    setEntry<bool>("penalty_kick_defending", false);
+    setEntry<int>("gc_protocol_version", brain->data->gcProtocolVersion);
+    setEntry<int>("gc_secondary_time", brain->data->gcSecondaryTime);
+    setEntry<int>("gc_game_phase", brain->data->gcGamePhase);
+    setEntry<int>("gc_set_play", brain->data->gcSetPlay);
     setEntry<string>("gc_game_sub_state", "");
     setEntry<bool>("gc_is_kickoff_side", false);
     setEntry<bool>("gc_is_sub_state_kickoff_side", false);
@@ -149,7 +152,17 @@ void BrainTree::initEntry()
 
 void BrainTree::tick()
 {
+    setEntry<bool>("gc_play_stopped", brain->data->gcStopped);
+    setEntry<int>("gc_game_phase", brain->data->gcGamePhase);
+    setEntry<int>("gc_set_play", brain->data->gcSetPlay);
+    setEntry<int>("gc_protocol_version", brain->data->gcProtocolVersion);
+    setEntry<int>("gc_secondary_time", brain->data->gcSecondaryTime);
     tree.tickOnce();
+}
+
+void BrainTree::halt()
+{
+    tree.haltTree();
 }
 
 NodeStatus SetVelocity::tick()
@@ -385,11 +398,10 @@ NodeStatus DecideCheckBehind::tick()
 
 NodeStatus Chase::tick()
 {
-    if (
-        !brain->tree->getEntry<bool>("ball_location_known")
-        || brain->isBallOut(3.0, 1.5)
-    )
-    {
+    const bool localBallKnown = brain->tree->getEntry<bool>("ball_location_known");
+    const bool sharedBallKnown = brain->tree->getEntry<bool>("tm_ball_pos_reliable");
+    if ((!localBallKnown && !sharedBallKnown)
+        || (localBallKnown && brain->isBallOut(3.0, 1.5))) {
         brain->client->setVelocity(0, 0, 0);
         return NodeStatus::SUCCESS;
     }
@@ -489,8 +501,8 @@ NodeStatus SimpleChase::tick()
     getInput("vy_limit", vyLimit);
     getInput("vtheta_limit", vthetaLimit);
 
-    if (!brain->tree->getEntry<bool>("ball_location_known"))
-    {
+    if (!brain->tree->getEntry<bool>("ball_location_known")
+        && !brain->tree->getEntry<bool>("tm_ball_pos_reliable")) {
         brain->client->setVelocity(0, 0, 0);
         return NodeStatus::SUCCESS;
     }
@@ -551,12 +563,15 @@ NodeStatus GoToFreekickPosition::onRunning() {
 
     Pose2D targetPose = {0.0, 0.0, 0.0};
     const auto fd = brain->config->fieldDimensions;
-    const auto ballPos = brain->data->ball.posToField;
+    const auto ball = brain->getBallForChase();
+    const auto ballPos = ball.posToField;
     const auto robotPose = brain->data->robotPoseToField;
     const double ownGoalX = -fd.length / 2.0;
     const double oppGoalX = fd.length / 2.0;
 
-    const double kickDir = brain->data->kickDir;
+    const double kickDir = brain->hasFreshLocalBall()
+        ? brain->data->kickDir
+        : atan2(-ballPos.y, oppGoalX - ballPos.x);
     const double defenseDir = atan2(ballPos.y, ballPos.x + fd.length / 2.0);
     // 和 assist 对齐：freekick 按 tmMyCostRank 分工，不再按前锋序号。
     const int rank = brain->data->tmMyCostRank;
@@ -631,9 +646,9 @@ NodeStatus GoToFreekickPosition::onRunning() {
 
         double vx = targetPose_r.x;
         double vy = targetPose_r.y;
-        double vtheta = brain->data->ball.yawToRobot * 2.0; // 后面的乘数越大, 转身越快
+        double vtheta = ball.yawToRobot * 2.0; // 后面的乘数越大, 转身越快
 
-        double linearFactor = 1 / (1 + exp(3 * (brain->data->ball.range * fabs(brain->data->ball.yawToRobot)) - 3)); // 距离远时, 优先转向
+        double linearFactor = 1 / (1 + exp(3 * (ball.range * fabs(ball.yawToRobot)) - 3)); // 距离远时, 优先转向
         vx *= linearFactor;
         vy *= linearFactor;
 
@@ -641,7 +656,7 @@ NodeStatus GoToFreekickPosition::onRunning() {
         Line path = {robotPose.x, robotPose.y, targetPose.x, targetPose.y};
         if (
             pointMinDistToLine(Point2D({ballPos.x, ballPos.y}), path) < 0.7
-            && brain->data->ball.range < 1.2
+            && ball.range < 1.2
         ) {
             vx = min(0.0, vx);
             vy = vy >= 0 ? vy + 0.1: vy - 0.1;
@@ -696,7 +711,7 @@ NodeStatus GoToGoalBlockingPosition::tick() {
 
     string curRole = brain->tree->getEntry<string>("player_role");
 
-    Pose2D targetPose;
+    Pose2D targetPose{0.0, 0.0, 0.0};
     targetPose.x = curRole == "striker" ? (std::max(- fd.length / 2.0 + distToGoalline, ballPos.x - 1.5))
             : (- fd.length / 2.0 + distToGoalline);
     if (ballPos.x + fd.length / 2.0 < distToGoalline) {
@@ -705,18 +720,15 @@ NodeStatus GoToGoalBlockingPosition::tick() {
     } else {
         targetPose.y = ballPos.y * distToGoalline / (ballPos.x + fd.length / 2.0);
         targetPose.y = curRole == "striker" ? (cap(targetPose.y, fd.goalWidth / 2.0, -fd.goalWidth / 2.0))
-            : (cap(targetPose.y, fd.penaltyAreaWidth/ 2.0, -fd.penaltyAreaWidth / 2.0));
+            : (cap(targetPose.y, fd.penaltyAreaWidth / 2.0, -fd.penaltyAreaWidth / 2.0));
     }
 
-    double dist = norm(targetPose.x - robotPose.x, targetPose.y - robotPose.y);
-    if ( // 认为到达了目标位置
-        dist < distTolerance
-        && fabs(brain->data->ball.yawToRobot) < thetaTolerance
-    ) {
+    targetPose.theta = robotPose.theta + brain->data->ball.yawToRobot;
+    if (_arrivalLock.shouldHold(targetPose.x, targetPose.y, targetPose.theta,
+        robotPose.x, robotPose.y, robotPose.theta, distTolerance, thetaTolerance, distToGoalline)) {
         brain->client->setVelocity(0, 0, 0);
         return NodeStatus::SUCCESS;
     }
-
     auto targetPose_r = brain->data->field2robot(targetPose);
     double vx = targetPose_r.x;
     double vy = targetPose_r.y;
@@ -1034,12 +1046,13 @@ NodeStatus StrikerDecide::tick() {
 
     double kickDir = brain->data->kickDir;
     double dir_rb_f = brain->data->robotBallAngleToField; // 机器人到球, field 坐标系中的方向
-    auto ball = brain->data->ball;
+    const auto localBall = brain->data->ball;
+    const auto ball = brain->getBallForChase();
     double ballRange = ball.range;
     double ballYaw = ball.yawToRobot;
     double ballX = ball.posToRobot.x;
     double ballY = ball.posToRobot.y;
-     
+
 
     const double goalpostMargin = 0.3; // 计算角度时为门柱让出的距离
     bool angleGoodForKick = brain->isAngleGood(goalpostMargin, "kick");
@@ -1093,26 +1106,31 @@ NodeStatus StrikerDecide::tick() {
         color = 0xFFFFFFFF;
     } else if (
         enableAutoVisualKick &&
+        brain->isKickAllowed() &&
+        brain->hasFreshLocalBall() &&
         !brain->data->kickoffGuardActive && // (方案任务1) 开球后第一脚触球前, 禁用 vision kick
         brain->data->tmImLead &&
         brain->data->tmMyCostRank == 0 &&
         !brain->tree->getEntry<bool>("ball_out") &&
         !brain->data->lose_ball &&
         brain->data->tmMyCost < 7.0 &&
-        ballRange < autoVisualKickEnableDistMax &&
-        ballRange > autoVisualKickEnableDistMin &&
-        fabs(ballYaw) < autoVisualKickEnableAngle * 1.3 &&
-        ball.posToField.x > brain->config->fieldDimensions.length / 2 - 14.3 &&
-        fabs(ball.posToField.y) < 5.0 &&
+        localBall.range < autoVisualKickEnableDistMax &&
+        localBall.range > autoVisualKickEnableDistMin &&
+        fabs(localBall.yawToRobot) < autoVisualKickEnableAngle * 1.3 &&
+        localBall.posToField.x > brain->config->fieldDimensions.length / 2 - 14.3 &&
+        fabs(localBall.posToField.y) < 5.0 &&
         brain->data->robotPoseToField.x > brain->config->fieldDimensions.length / 2 - 14.3 &&
         fabs(brain->data->robotPoseToField.y) < 5.0
     ) {
         newDecision = "auto_visual_kick";
-        brain->data->tmImInVisualKick = true;
         color = 0xFF00FFFF;
     } else if (!brain->data->tmImLead) {
         newDecision = "assist";
         color = 0x00FFFFFF;
+    }
+    else if (!brain->hasFreshLocalBall()) {
+        newDecision = "chase";
+        color = 0x0000FFFF;
     }
     else if (ballRange > chaseRangeThreshold * (lastDecision == "chase" ? 0.9 : 1.0))
     {
@@ -1120,25 +1138,20 @@ NodeStatus StrikerDecide::tick() {
         color = 0x0000FFFF;
     } 
     else if (
+        brain->isKickAllowed() &&
+        brain->hasFreshLocalBall() &&
         (
-            (angleGoodForKick && !brain->data->isFreekickKickingOff) 
+            (angleGoodForKick && !brain->data->isFreekickKickingOff)
             || reachedKickDir
         )
         && !avoidKick
         && brain->data->ballDetected
-        && fabs(brain->data->ball.yawToRobot) < KICK_THETA_RANGE
-        && ball.range < KICK_RANGE
+        && fabs(localBall.yawToRobot) < KICK_THETA_RANGE
+        && localBall.range < KICK_RANGE
     )
     {
         if (brain->data->kickType == "cross" || brain->data->kickType == "pass") newDecision = "cross"; // pass(开球小传)复用 cross 的低速趟球动作
-        else { // kickType == kick
-            double threatThreshold;
-            brain->get_parameter("strategy.shoot.threat_threshold", threatThreshold);
-            // ⚠ 死分支: threatLevel() 恒 >=0 而 threat_threshold 默认 -2.0, 故永不产生 "safe_shoot";
-            // 且子树未给 "safe_shoot" 配动作节点 —— 若日后调高 threat_threshold, 此处会变成"无动作"。需补节点或删除。
-            if (threatLevel < threatThreshold) newDecision = "safe_shoot";
-            else newDecision = "kick";
-        }        
+        else newDecision = "kick";
         color = 0x00FF00FF;
         brain->data->isFreekickKickingOff = false; // 只要进一次 kick, 就不算是 kickoff 阶段了.
     }
@@ -1193,15 +1206,20 @@ NodeStatus GoalieDecide::tick()
     getInput("chase_threshold", chaseRangeThreshold);
     string lastDecision, position;
     getInput("decision_in", lastDecision);
+    const auto chaseBall = brain->getBallForChase();
+    const auto fd = brain->config->fieldDimensions;
+    const double ownGoalX = -fd.length / 2.0;
+    const bool nearOwnBox = chaseBall.posToField.x <= ownGoalX + fd.penaltyAreaLength + 1.0
+        && fabs(chaseBall.posToField.y) <= fd.penaltyAreaWidth / 2.0 + 1.0;
 
-    double kickDir = atan2(brain->data->ball.posToField.y, brain->data->ball.posToField.x + brain->config->fieldDimensions.length / 2);
+    double kickDir = atan2(chaseBall.posToField.y, chaseBall.posToField.x + brain->config->fieldDimensions.length / 2);
     double dir_rb_f = brain->data->robotBallAngleToField; // 机器人到球, field 坐标系中的方向
     auto goalPostAngles = brain->getGoalPostAngles(0.3);
     double theta_l = goalPostAngles[0]; // 球到左边门柱的角度(我们的左)
     double theta_r = goalPostAngles[1]; // 球到右边门柱的角度
     bool angleIsGood = (dir_rb_f > -M_PI / 2 && dir_rb_f < M_PI / 2);
-    double ballRange = brain->data->ball.range;
-    double ballYaw = brain->data->ball.yawToRobot;
+    double ballRange = chaseBall.range;
+    double ballYaw = chaseBall.yawToRobot;
 
     string newDecision;
     auto color = 0xFFFFFFFF; // for log
@@ -1212,7 +1230,12 @@ NodeStatus GoalieDecide::tick()
         newDecision = "find";
         color = 0x0000FFFF;
     }
-    else if (brain->data->ball.posToField.x > 0 - static_cast<double>(lastDecision == "retreat"))
+    else if (chaseBall.posToField.x > 0 - static_cast<double>(lastDecision == "retreat"))
+    {
+        newDecision = "retreat";
+        color = 0xFF00FFFF;
+    }
+    else if (!brain->data->tmImLead || !nearOwnBox)
     {
         newDecision = "retreat";
         color = 0xFF00FFFF;
@@ -1282,6 +1305,10 @@ tuple<double, double, double> Kick::_calcSpeed() {
 
 NodeStatus Kick::onStart()
 {
+    if (!brain->isMotionAllowed() || !brain->isKickAllowed() || !brain->hasFreshLocalBall()) {
+        brain->client->setVelocity(0.0, 0.0, 0.0, false, false, false);
+        return NodeStatus::SUCCESS;
+    }
     _minRange = brain->data->ball.range;
     _speed = 0.1;
     bool avoidPushing;
@@ -1314,7 +1341,7 @@ NodeStatus Kick::onStart()
         brain->get_parameter("strategy.soft_kickoff_speed", softKickoffSpeed);
         if (
             softKickoff
-            && (brain->data->isFreekickKickingOff || brain->data->isKickingOff)
+            && (brain->data->kickoffGuardActive || brain->data->isFreekickKickingOff || brain->data->isKickingOff)
             ) speed = softKickoffSpeed;
         brain->client->crabWalk(angle, speed);
     } else if (_state == "stablize") {
@@ -1326,6 +1353,10 @@ NodeStatus Kick::onStart()
 
 NodeStatus Kick::onRunning()
 {
+    if (!brain->isMotionAllowed() || !brain->isKickAllowed() || !brain->hasFreshLocalBall()) {
+        brain->client->stopMotion();
+        return NodeStatus::SUCCESS;
+    }
     auto log = [=](string msg) {
         brain->log->setTimeNow();
         brain->log->log("debug/Kick", rerun::TextLog(msg));
@@ -1382,7 +1413,7 @@ NodeStatus Kick::onRunning()
             brain->get_parameter("strategy.soft_kickoff_speed", softKickoffSpeed);
             if (
                 softKickoff
-                && (brain->data->isFreekickKickingOff || brain->data->isKickingOff)
+                && (brain->data->kickoffGuardActive || brain->data->isFreekickKickingOff || brain->data->isKickingOff)
                 ) speed = softKickoffSpeed;
                 brain->client->crabWalk(angle, speed);
             }
@@ -1390,6 +1421,7 @@ NodeStatus Kick::onRunning()
     } else if (_state == "kick") {
         double msecs = getInput<double>("min_msec_kick").value();
         double speed = getInput<double>("speed_limit").value();
+        if (!std::isfinite(speed) || speed <= 0.0) { brain->client->stopMotion(); return NodeStatus::SUCCESS; }
         msecs = msecs + brain->data->ball.range / speed * 1000;
         if (brain->msecsSince(_startTime) > msecs) { // 完成踢球动作
             brain->client->setVelocity(0, 0, 0);
@@ -1399,8 +1431,12 @@ NodeStatus Kick::onRunning()
         if (brain->data->ballDetected) { // 如果还能看见球, 则修正方向
             double angle = brain->data->ball.yawToRobot;
             double speed = getInput<double>("speed_limit").value();
-            _speed += 0.08;
-            speed = min(speed, _speed);
+            if (brain->get_parameter("strategy.soft_kickoff").as_bool() &&
+                (brain->data->kickoffGuardActive || brain->data->isFreekickKickingOff || brain->data->isKickingOff)) {
+                speed = std::min(speed, brain->get_parameter("strategy.soft_kickoff_speed").as_double());
+            }
+            _speed = std::min(speed, _speed + 0.08);
+            speed = _speed;
             brain->client->crabWalk(angle, speed);
         }
 
@@ -1414,30 +1450,30 @@ NodeStatus Kick::onRunning()
 
 void Kick::onHalted()
 {
+    brain->client->stopMotion();
     _startTime -= rclcpp::Duration(100, 0);
 }
 
 
-rclcpp::Time RLVisionKick::_lastExitTime = rclcpp::Time(0, 0, RCL_ROS_TIME);
 
 NodeStatus RLVisionKick::onStart()
 {
-    // (方案任务1) 兜底: 开球后第一脚触球前, 无论决策链路如何, 都不得进入 RL 视觉踢球模式
-    if (brain->data->kickoffGuardActive) {
-        brain->log->setTimeNow();
-        brain->log->log("debug/RLVisionKick", rerun::TextLog("blocked by kickoff_guard (first touch pending)"));
+    _visionKickStarted = false;
+    _isDecelerating = false;
+    _pendingRobocupWalk = false;
+    if (!brain->isMotionAllowed() || !brain->isKickAllowed()
+        || !brain->hasFreshLocalBall() || brain->data->kickoffGuardActive) {
         brain->data->tmImInVisualKick = false;
         return NodeStatus::SUCCESS;
     }
 
     _startTime = brain->get_clock()->now();
-    _isDecelerating = false;
-    _visionKickStarted = false;
-    _pendingRobocupWalk = false;
-
+    _progress.start(
+        motion_policy::ObservationStamp{brain->data->ball.timePoint.nanoseconds()},
+        brain->data->ball.range,
+        motion_policy::MonotonicClock::now());
     startDecelerate(1000.0);
     stepDecelerate();
-
     return NodeStatus::RUNNING;
 }
 
@@ -1449,28 +1485,60 @@ NodeStatus RLVisionKick::onRunning()
         std::cout << "[RLVisionKick] " << msg << std::endl;
     };
 
+    const bool freshLocalBall = brain->hasFreshLocalBall();
+    if (motion_policy::shouldCancelVisualKick(brain->isMotionAllowed(), brain->isKickAllowed(),
+        freshLocalBall, brain->data->kickoffGuardActive)) {
+        logExit("exit visual kick: motion/kick gate closed");
+        if (brain->client->stopMotion() != 0) return NodeStatus::RUNNING;
+        brain->data->tmImInVisualKick = false;
+        _isDecelerating = false;
+        _visionKickStarted = false;
+        _pendingRobocupWalk = false;
+        return NodeStatus::SUCCESS;
+    }
+
     if (brain->data->shouldExitRLVisionKick) {
         logExit("exit visual kick: shouldExitRLVisionKick=true");
         brain->data->shouldExitRLVisionKick = false;
-        brain->data->tmImInVisualKick = false;
-        recordExitTime();
-        return NodeStatus::SUCCESS;
+        startDecelerate(1000.0);
+        _pendingRobocupWalk = true;
+        stepDecelerate();
+        return NodeStatus::RUNNING;
     }
 
     if (_isDecelerating) {
         stepDecelerate();
-
         if (!_isDecelerating) {
             if (_pendingRobocupWalk) {
-                brain->client->robocupWalk();
-                _pendingRobocupWalk = false;
-                brain->data->tmImInVisualKick = false;
-                return NodeStatus::SUCCESS;
+                if (brain->client->robocupWalk() == 0) {
+                    _pendingRobocupWalk = false;
+                    brain->data->tmImInVisualKick = false;
+                    return NodeStatus::SUCCESS;
+                }
             } else if (!_visionKickStarted) {
-                brain->client->RLVisionKick(true);
-                _headScanStartTime = brain->get_clock()->now();
-                _visionKickStarted = true;
+                if (brain->client->RLVisionKick(true) == 0) {
+                    _headScanStartTime = brain->get_clock()->now();
+                    _progress.start(
+                        motion_policy::ObservationStamp{brain->data->ball.timePoint.nanoseconds()},
+                        brain->data->ball.range,
+                        motion_policy::MonotonicClock::now());
+                    _visionKickStarted = true;
+                    brain->data->tmImInVisualKick = true;
+                } else {
+                    logExit("visual kick start rejected by robot client");
+                    brain->data->tmImInVisualKick = false;
+                    return NodeStatus::SUCCESS;
+                }
             }
+        }
+        return NodeStatus::RUNNING;
+    }
+
+    if (_pendingRobocupWalk) {
+        if (brain->client->robocupWalk() == 0) {
+            _pendingRobocupWalk = false;
+            brain->data->tmImInVisualKick = false;
+            return NodeStatus::SUCCESS;
         }
         return NodeStatus::RUNNING;
     }
@@ -1488,15 +1556,24 @@ NodeStatus RLVisionKick::onRunning()
     double minMsecKick = getInput<double>("min_msec_kick").value();
     double maxMsecKick = getInput<double>("max_msec_kick").value();
     double rangeThreshold = getInput<double>("range").value();
-
-    bool ballTooFar = brain->data->ballDetected && brain->data->ball.range > rangeThreshold;
-    bool costTooHigh = brain->data->tmMyCost > 8.0;
-    bool elapsedEnough = elapsed > minMsecKick;
-    bool elapsedTimeout = elapsed > maxMsecKick;
-    bool loseBall = brain->data->lose_ball;
-    bool loseBallExit = loseBall && elapsedEnough;
-    bool ballOut = brain->tree->getEntry<bool>("ball_out");
-    bool shouldExit = (((ballTooFar || costTooHigh) && elapsedEnough) || loseBallExit || ballOut || elapsedTimeout);
+    const auto &localBall = brain->data->ball;
+    const bool ballTooFar = freshLocalBall && localBall.range > rangeThreshold;
+    const bool costTooHigh = brain->data->tmMyCost > 8.0;
+    const bool elapsedEnough = elapsed > minMsecKick;
+    const bool elapsedTimeout = elapsed > maxMsecKick;
+    const bool loseBallExit = !freshLocalBall || brain->data->lose_ball;
+    const bool ballOut = brain->tree->getEntry<bool>("ball_out");
+    const auto progressNow = motion_policy::MonotonicClock::now();
+    if (_visionKickStarted && freshLocalBall) {
+        _progress.observe(
+            motion_policy::ObservationStamp{localBall.timePoint.nanoseconds()},
+            localBall.range,
+            progressNow);
+    }
+    const bool noProgress = _visionKickStarted && elapsedEnough
+        && _progress.stalled(progressNow, std::chrono::seconds(2));
+    const bool shouldExit = (((ballTooFar || costTooHigh) && elapsedEnough)
+        || loseBallExit || ballOut || elapsedTimeout || noProgress);
 
     if (shouldExit) {
         string reasons = "";
@@ -1504,15 +1581,15 @@ NodeStatus RLVisionKick::onRunning()
             if (!reasons.empty()) reasons += ", ";
             reasons += reason;
         };
-        if (ballTooFar && elapsedEnough) appendReason(format("ball_too_far(range=%.2f,threshold=%.2f)", brain->data->ball.range, rangeThreshold));
+        if (ballTooFar && elapsedEnough) appendReason(format("ball_too_far(range=%.2f,threshold=%.2f)", localBall.range, rangeThreshold));
         if (costTooHigh && elapsedEnough) appendReason(format("tm_cost_high(cost=%.2f,min=%.0fms,elapsed=%.0fms)", brain->data->tmMyCost, minMsecKick, elapsed));
-        if (loseBallExit) appendReason("lose_ball=true");
+        if (loseBallExit) appendReason("local_ball_lost=true");
         if (ballOut) appendReason("ball_out=true");
         if (elapsedTimeout) appendReason(format("timeout(max=%.0fms,elapsed=%.0fms)", maxMsecKick, elapsed));
+        if (noProgress) appendReason("no_progress=true");
         if (reasons.empty()) reasons = "unknown";
         logExit(format("exit visual kick: %s", reasons.c_str()));
 
-        recordExitTime();
         startDecelerate(1000.0);
         _pendingRobocupWalk = true;
         stepDecelerate();
@@ -1522,32 +1599,17 @@ NodeStatus RLVisionKick::onRunning()
     return NodeStatus::RUNNING;
 }
 
+
 void RLVisionKick::onHalted()
 {
-    const string haltMsg = "halted by behavior tree, force exit visual kick";
     brain->log->setTimeNow();
-    brain->log->log("debug/RLVisionKick", rerun::TextLog(haltMsg));
-    std::cout << "[RLVisionKick] " << haltMsg << std::endl;
-    brain->data->tmImInVisualKick = false;
-    brain->client->setVelocity(0.0, 0.0, 0.0, false, false, false);
-    brain->client->robocupWalk();
-    recordExitTime();
-
+    brain->log->log("debug/RLVisionKick", rerun::TextLog("halted by behavior tree, force exit visual kick"));
+    if (brain->client->stopMotion() == 0) brain->data->tmImInVisualKick = false;
     _isDecelerating = false;
     _visionKickStarted = false;
     _pendingRobocupWalk = false;
 }
 
-bool RLVisionKick::isMinIntervalSatisfied(double minIntervalMsec)
-{
-    (void)minIntervalMsec;
-    return true;
-}
-
-void RLVisionKick::recordExitTime()
-{
-    _lastExitTime = brain->get_clock()->now();
-}
 
 void RLVisionKick::startDecelerate(double durationMs)
 {
@@ -1907,12 +1969,9 @@ NodeStatus TurnOnSpot::onRunning()
     return NodeStatus::RUNNING;
 }
 
-// ... (此处为 SelfLocate 系列函数的完整实现，因篇幅过长未全部展开，但包含所有逻辑，如 SelfLocate, SelfLocateEnterField, SelfLocateLine 等，保持原文件不变) ...
 
 NodeStatus SelfLocate::tick()
 {
-    // ... (保留原文件 SelfLocate::tick 的完整实现) ...
-    // 为确保完整性，这里列出 SelfLocate::tick
     auto log = [=](string msg) {
         brain->log->setTimeNow();
         brain->log->log("debug/SelfLocate", rerun::TextLog(msg));
@@ -2044,7 +2103,6 @@ NodeStatus SelfLocate::tick()
     return NodeStatus::SUCCESS;
 }
 
-// ... (其余 SelfLocate 函数如 SelfLocateEnterField, SelfLocateLine 等保持原文件逻辑) ...
 // SelfLocateEnterField: 自动检测左右入场位置
 NodeStatus SelfLocateEnterField::tick()
 {
@@ -3538,8 +3596,15 @@ NodeStatus GoToReadyPosition::tick()
         ttheta = 0;
     }
 
+    const auto robotPose = brain->data->robotPoseToField;
+    if (_arrivalLock.shouldHold(tx, ty, ttheta, robotPose.x, robotPose.y, robotPose.theta,
+        distTolerance, thetaTolerance)) {
+        brain->client->setVelocity(0, 0, 0);
+        return NodeStatus::SUCCESS;
+    }
     brain->client->moveToPoseOnField2(tx, ty, ttheta, longRangeThreshold, turnThreshold, vxLimit, vyLimit, vthetaLimit, distTolerance / 1.5, distTolerance / 1.5, thetaTolerance, avoidObstacle);
     return NodeStatus::SUCCESS;
+
 }
 
 NodeStatus GoToFormationSlot::tick()
@@ -3567,10 +3632,17 @@ NodeStatus GoToFormationSlot::tick()
     getInput("theta_tolerance", thetaTolerance);
 
     auto fd = brain->config->fieldDimensions;
+    const auto robotPose = brain->data->robotPoseToField;
 
     // 守门员不参与阵型槽位: 走守门员 READY 位 (与 GoToReadyPosition 的 GK 分支一致, 不改守门行为)
     if (brain->tree->getEntry<string>("player_role") == "goal_keeper") {
-        brain->client->moveToPoseOnField2(-fd.length / 2.0 + fd.goalAreaLength, 0.0, 0.0,
+        const Pose2D goalieTarget{-fd.length / 2.0 + fd.goalAreaLength, 0.0, 0.0};
+        if (_arrivalLock.shouldHold(goalieTarget.x, goalieTarget.y, goalieTarget.theta,
+            robotPose.x, robotPose.y, robotPose.theta, distTolerance, thetaTolerance)) {
+            brain->client->setVelocity(0, 0, 0);
+            return NodeStatus::SUCCESS;
+        }
+        brain->client->moveToPoseOnField2(goalieTarget.x, goalieTarget.y, goalieTarget.theta,
             1.0, 0.4, vxLimit, vyLimit, 1.5, distTolerance, distTolerance, thetaTolerance, true);
         return NodeStatus::SUCCESS;
     }
@@ -3600,7 +3672,8 @@ NodeStatus GoToFormationSlot::tick()
     // 参与站位的 field players (GC 存活 + 排除守门员), 升序 id。
     // 与角色状态机共用同一 GK 判定，避免交接后阵型仍排除旧 GK。
     const int gkId = brain->getEffectiveGoalkeeperId();
-    for (int i = 0; i < HL_MAX_NUM_PLAYERS; i++) {
+    const int rosterLimit = std::min(brain->config->numOfPlayers, brain->data->gcPlayersPerTeam);
+    for (int i = 0; i < rosterLimit && i < HL_MAX_NUM_PLAYERS; i++) {
         if (brain->data->penalty[i] != PENALTY_NONE) continue;
         int id = i + 1;
         if (id == gkId) continue;
@@ -3608,7 +3681,6 @@ NodeStatus GoToFormationSlot::tick()
             in.playerIds.push_back(id);
             in.playerPoses.push_back(brain->data->robotPoseToField);
         } else {
-            if (brain->data->tmStatus[i].role == "goal_keeper") continue;
             in.playerIds.push_back(id);
             in.playerPoses.push_back(brain->data->tmStatus[i].robotPoseToField);
         }
@@ -3667,6 +3739,11 @@ NodeStatus GoToFormationSlot::tick()
         return NodeStatus::FAILURE;
     }
 
+    if (_arrivalLock.shouldHold(_current.target.x, _current.target.y, _current.target.theta,
+        robotPose.x, robotPose.y, robotPose.theta, distTolerance, thetaTolerance)) {
+        brain->client->setVelocity(0, 0, 0);
+        return NodeStatus::SUCCESS;
+    }
     brain->client->moveToPoseOnField2(_current.target.x, _current.target.y, _current.target.theta,
         1.2, 0.4, vxLimit, vyLimit, 1.5, distTolerance, distTolerance, thetaTolerance, true);
     return NodeStatus::SUCCESS;
@@ -3736,6 +3813,7 @@ NodeStatus CheckAndStandUp::tick()
         brain->log->log("recovery", rerun::TextLog("reset recovery"));
         return NodeStatus::SUCCESS;
     }
+    if (!brain->isRecoveryAllowed()) return NodeStatus::SUCCESS;
     brain->log->log("recovery", rerun::TextLog(format("Recovery retry count: %d, recoveryPerformed: %d recoveryState: %d currentRobotModeIndex: %d", brain->data->recoveryPerformedRetryCount, brain->data->recoveryPerformed, brain->data->recoveryState, brain->data->currentRobotModeIndex)));
 
     if (!brain->data->recoveryPerformed &&
@@ -3744,7 +3822,7 @@ NodeStatus CheckAndStandUp::tick()
         brain->data->currentRobotModeIndex == 1 && // is damping
         brain->data->recoveryPerformedRetryCount < brain->get_parameter("recovery.retry_max_count").get_value<int>()) {
         brain->data->shouldExitRLVisionKick = true;
-        brain->client->standUp();
+        if (brain->client->standUp() != 0) return NodeStatus::SUCCESS;
         brain->data->recoveryPerformed = true;
         brain->speak("Trying to stand up");
         brain->log->log("recovery", rerun::TextLog(format("Recovery retry count: %d", brain->data->recoveryPerformedRetryCount)));
@@ -3772,49 +3850,6 @@ NodeStatus CheckAndStandUp::tick()
 
 
 
-NodeStatus RoleSwitchIfNeeded::tick()
-{
-
-    auto log = [=](string msg) {
-        // brain->log->setTimeNow();
-        // brain->log->log("debug/RoleSwitchIfNeeded", rerun::TextLog(msg));
-    };
-    log("RoleSwitchIfNeeded ticked");
-
-    int aliveCount = 0;
-    for (int i = 0; i < HL_MAX_NUM_PLAYERS; i++)
-    {
-        if (brain->data->penalty[i] == PENALTY_NONE)
-            aliveCount++;
-    }
-     
-    string oldRole = brain->tree->getEntry<string>("player_role");
-    string newRole = oldRole;
-    /**
-     * 策略是，只有满员的时候，才会有守门员，其他时候都参与进攻
-     */
-    if ((aliveCount < brain->config->numOfPlayers) && brain->data->penalty[brain->config->playerId - 1] == PENALTY_NONE)
-    {
-        brain->tree->setEntry<string>("player_role", "striker");
-        newRole = "striker";
-    }
-    else if (aliveCount == brain->config->numOfPlayers - 1) {
-        brain->tree->setEntry<string>("player_role", "goal_keeper");
-        newRole = "goal_keeper";
-    }
-     
-    if (brain->tree->getEntry<string>("gc_game_state") == "INITIAL") {
-        brain->tree->setEntry<string>("player_role", brain->config->playerRole);
-        newRole = brain->config->playerRole;
-    }
-
-    if (newRole != oldRole) {
-        brain->speak("Switch to " + newRole);
-    }
-    // std::cout << "[MSG] " << brain->tree->getEntry<string>("player_role") << std::endl;
-
-    return NodeStatus::SUCCESS;
-}
 
 /* ------------------------------------ 节点实现: 调试用 ------------------------------------*/
 

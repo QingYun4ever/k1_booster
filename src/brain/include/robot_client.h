@@ -159,11 +159,19 @@ public:
     // 估算目前是否是静止站立状态
     bool isStandingStill(double timeBuffer = 1000);
 
+    // Stop locomotion and cancel tracked kick skills. Safe to call repeatedly.
+    int stopMotion();
+
 private:
     int call(booster_interface::msg::BoosterApiReqMsg msg);
     rclcpp::Publisher<booster_msgs::msg::RpcReqMsg>::SharedPtr publisher;
     Brain *brain;
-    double _vx, _vy, _vtheta;
+    double _vx = 0.0, _vy = 0.0, _vtheta = 0.0;
     rclcpp::Time _lastCmdTime;
     rclcpp::Time _lastNonZeroCmdTime;
+    bool _stopMotionActive = false;
+    bool _visualKickActive = false;
+    bool _rlKickActive = false;
+    bool _goalieSquatActive = false;
+    bool _fancyKickActive = false;
 };

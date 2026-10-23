@@ -1,7 +1,7 @@
 #!/bin/bash
 
-cd `dirname $0`
-cd ..
+set -e
+cd "$(dirname "$0")/.."
 
 export PYTHONWARNINGS="ignore::DeprecationWarning,ignore::UserWarning,ignore::FutureWarning"
 

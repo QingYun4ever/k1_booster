@@ -27,6 +27,8 @@ public:
     // 真正要设置默认值得在 BrainNode 的 declare_parameter 里配置
     int teamId;                 // 对应 game.team_id
     int playerId;               // 对应 game.player_id
+    int goalkeeperId = 3;
+    double gameControllerTimeoutMs = 2000.0;
     string fieldType;           // 对应 game.field_type  球场类型, "adult_size"(14*9) | "kid_size" (9*6)
     string playerRole;          // 对应 game.player_role   "striker" | "goal_keeper"
     string playerStartPos;      // 对应 game.player_start_post  "left" | "right", 从自己半场的左侧还是右侧上场
@@ -54,7 +56,7 @@ public:
     vector<FieldLine> mapLines;       // 地图上的标线的理论位置, 用于比较和识别看到的标线
     vector<MapMarking> mapMarkings;   // 地图上的标志点的理论位置, 用于比较和识别看到的标志点
     
-    int numOfPlayers = 2;            // 2; // 机器人数量, 2及2以上，用于做自动决策切换
+    int numOfPlayers = 3;
 
     // 避障参数
     double collisionThreshold;        // 碰撞阈值, 当障碍物距离小于此值时, 认为需要避障
@@ -108,7 +110,7 @@ public:
     double nearBallRange = 2.0;            // 靠近球时的范围, 在这个范围内, 限制速度
 
     // 队友间高置信度球位置共享 (独立 package k1_teammate_ball)。对应 config.yaml 中 teammate_ball_share.*
-    bool tmBallShareEnable = false;                 // 是否启用 (关闭时沿用原有按距离选最近队友球的逻辑)
+    bool tmBallShareEnable = false; // false disables sharing; no unsafe fallback path
     double tmBallShareMinConfidenceToShare = 50.0;  // 自己置信度高于此值才视为可共享 (发送侧/调试用)
     double tmBallShareMinConfidenceToTrust = 50.0;  // 队友球置信度高于此值才纳入融合 (高置信度门控)
     double tmBallShareTrustTimeout = 1.0;           // 无新可信来源时维持上次结果的最长秒数

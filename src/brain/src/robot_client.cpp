@@ -34,6 +34,8 @@ void RobotClient::init()
 
 int RobotClient::call(booster_interface::msg::BoosterApiReqMsg msg)
 {
+    if (!publisher) return -1;
+
     std::string uuid = gen_uuid();
     auto message = booster_msgs::msg::RpcReqMsg();
     message.uuid = uuid;
@@ -48,9 +50,12 @@ int RobotClient::call(booster_interface::msg::BoosterApiReqMsg msg)
 
 int RobotClient::moveHead(double pitch, double yaw)
 {
+    if (!std::isfinite(pitch) || !std::isfinite(yaw)) return -1;
+    if (brain->data->gcReceived && brain->data->gcStopped) return -1;
+
     // 软限位
     yaw = cap(yaw, brain->config->headYawLimitLeft, brain->config->headYawLimitRight);
-    pitch = cap(pitch, brain->config->headPitchLimitDown, brain->config->headPitchLimitUp); // 两端都夹: [抬头 0.2, 低头 0.85]
+    pitch = cap(pitch, brain->config->headPitchLimitDown, brain->config->headPitchLimitUp);
 
     brain->log->setTimeNow();
     auto level = (fabs(pitch) > 2.0 || fabs(yaw) > 2.0) ? rerun::TextLogLevel::Error : rerun::TextLogLevel::Info;
@@ -61,6 +66,8 @@ int RobotClient::moveHead(double pitch, double yaw)
 
 int RobotClient::standUp()
 {
+    if (!brain->isRecoveryAllowed()) return -1;
+
     booster_interface::msg::BoosterApiReqMsg msg;
     msg.api_id = static_cast<int64_t>(booster::robot::b1::LocoApiId::kGetUp);
     nlohmann::json body;
@@ -71,84 +78,118 @@ int RobotClient::standUp()
 
 int RobotClient::kickBall(double kick_speed, double kick_dir, bool cancel)
 {
-    setVelocity(0.0, 0.0, 0.0, false, false, false); // 停止运动，准备踢球
-    std::this_thread::sleep_for(std::chrono::milliseconds(10)); // 10ms后再发踢球命令,否则踢球命令可能下发不下去,原因待查
+    if (cancel) {
+        if (!_rlKickActive) return 0;
+        kick_speed = 0.0;
+        kick_dir = 0.0;
+    } else {
+        if (!std::isfinite(kick_speed) || !std::isfinite(kick_dir)) return -1;
+        if (!brain->isKickAllowed() || !brain->hasFreshLocalBall()) return -1;
+        if (setVelocity(0.0, 0.0, 0.0, false, false, false) != 0) return -1;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
 
     std::string param = BuildRLSkillKickParams(kick_speed, kick_dir, cancel);
-
     booster_interface::msg::BoosterApiReqMsg msg;
     msg.api_id = kApiIdRLKickBall;
     msg.body = param;
-
-    return call(msg);
+    const int result = call(msg);
+    if (result == 0) _rlKickActive = !cancel;
+    return result;
 }
+
 
 int RobotClient::walkMode()
 {
+    if (!brain->isMotionAllowed()) return -1;
     booster_interface::msg::BoosterApiReqMsg msg;
     msg.api_id = static_cast<int64_t>(booster_internal::robot::b1::LocoInternalApiId::kEnableRobocupWalkMode);
     nlohmann::json body;
     msg.body = body.dump();
-
     return call(msg);
 }
 
 int RobotClient::fancyKickBall(double kick_speed, double kick_dir, bool cancel)
 {
-    std::string param = BuildRLSkillKickParams(kick_speed, kick_dir, cancel);
+    if (cancel) {
+        if (!_fancyKickActive) return 0;
+        kick_speed = 0.0;
+        kick_dir = 0.0;
+    } else {
+        if (!std::isfinite(kick_speed) || !std::isfinite(kick_dir)) return -1;
+        if (!brain->isKickAllowed() || !brain->hasFreshLocalBall()) return -1;
+        if (setVelocity(0.0, 0.0, 0.0, false, false, false) != 0) return -1;
+    }
 
     booster_interface::msg::BoosterApiReqMsg msg;
     msg.api_id = kApiIdRLFancyKickBall;
-    msg.body = param;
-
-    return call(msg);
+    msg.body = BuildRLSkillKickParams(kick_speed, kick_dir, cancel);
+    const int result = call(msg);
+    if (result == 0) _fancyKickActive = !cancel;
+    return result;
 }
 
 int RobotClient::goalieSquatDown(bool squat)
 {
-    auto goalie_squat_param = squat ? 
-        booster_internal::robot::b1::SquatDirection::kSquatDown : 
-        booster_internal::robot::b1::SquatDirection::kSquatUp;
-    booster_internal::robot::b1::GoalieSquatDownParameter goalie_squat_down_param(goalie_squat_param, booster_internal::robot::b1::SquatSide::kLeft);
-    std::string param = goalie_squat_down_param.ToJson().dump();
+    if (!brain->isMotionAllowed()) return -1;
+    if (!squat && !_goalieSquatActive) return 0;
 
+    auto direction = squat ?
+        booster_internal::robot::b1::SquatDirection::kSquatDown :
+        booster_internal::robot::b1::SquatDirection::kSquatUp;
+    booster_internal::robot::b1::GoalieSquatDownParameter param(direction, booster_internal::robot::b1::SquatSide::kLeft);
     booster_interface::msg::BoosterApiReqMsg msg;
     msg.api_id = static_cast<int64_t>(booster_internal::robot::b1::LocoInternalApiId::kGoalieSquatDown);
-    msg.body = param;
-    return call(msg);
+    msg.body = param.ToJson().dump();
+    const int result = call(msg);
+    if (result == 0) _goalieSquatActive = squat;
+    return result;
 }
 
 int RobotClient::squatBlock(string side)
 {
-    brain->log->log("RobotClient/squatDown", rerun::TextLog("SquatBlock action called, side: " + side));
-
+    if (!brain->isMotionAllowed()) return -1;
     if (side != "left" && side != "right") {
         prtErr("RobotClient::squatBlock: side must be left or right");
         return -1;
     }
-    booster_internal::robot::b1::GoalieSquatDownParameter param(booster_internal::robot::b1::SquatDirection::kSquatDown, side == "left" ? booster_internal::robot::b1::SquatSide::kLeft : booster_internal::robot::b1::SquatSide::kRight);
-    std::string param_json = param.ToJson().dump();
-
+    brain->log->log("RobotClient/squatDown", rerun::TextLog("SquatBlock action called, side: " + side));
+    booster_internal::robot::b1::GoalieSquatDownParameter param(
+        booster_internal::robot::b1::SquatDirection::kSquatDown,
+        side == "left" ? booster_internal::robot::b1::SquatSide::kLeft : booster_internal::robot::b1::SquatSide::kRight);
     booster_interface::msg::BoosterApiReqMsg msg;
     msg.api_id = static_cast<int64_t>(booster_internal::robot::b1::LocoInternalApiId::kGoalieSquatDown);
-    msg.body = param_json;
-    return call(msg);
+    msg.body = param.ToJson().dump();
+    const int result = call(msg);
+    if (result == 0) _goalieSquatActive = true;
+    return result;
 }
 
 int RobotClient::squatUp()
 {
+    if (!brain->isMotionAllowed()) return -1;
     brain->log->log("RobotClient/squatUp", rerun::TextLog("Squat up action called"));
-    booster_internal::robot::b1::GoalieSquatDownParameter param(booster_internal::robot::b1::SquatDirection::kSquatUp, booster_internal::robot::b1::SquatSide::kLeft);
-    std::string param_json = param.ToJson().dump();
-
+    booster_internal::robot::b1::GoalieSquatDownParameter param(
+        booster_internal::robot::b1::SquatDirection::kSquatUp,
+        booster_internal::robot::b1::SquatSide::kLeft);
     booster_interface::msg::BoosterApiReqMsg msg;
     msg.api_id = static_cast<int64_t>(booster_internal::robot::b1::LocoInternalApiId::kGoalieSquatDown);
-    msg.body = param_json;
-    return call(msg);
+    msg.body = param.ToJson().dump();
+    const int result = call(msg);
+    if (result == 0) _goalieSquatActive = false;
+    return result;
 }
+
 
 int RobotClient::RLVisionKick(bool start)
 {
+    if (start) {
+        if (!brain->isKickAllowed() || !brain->hasFreshLocalBall() || brain->data->kickoffGuardActive) return -1;
+        if (_visualKickActive) return 0;
+    } else if (!_visualKickActive) {
+        return 0;
+    }
+
     booster_interface::msg::BoosterApiReqMsg msg;
     msg.api_id = static_cast<int64_t>(booster::robot::b1::LocoApiId::kVisualKick);
     nlohmann::json body;
@@ -159,32 +200,25 @@ int RobotClient::RLVisionKick(bool start)
         verLower.push_back(static_cast<char>(std::tolower(c)));
     }
     booster::robot::b1::VisualKickVersion vk = booster::robot::b1::VisualKickVersion::kV2;
-    if (verLower == "kv1" || verLower == "v1") {
-        vk = booster::robot::b1::VisualKickVersion::kV1;
-    } else if (verLower == "kv2" || verLower == "v2") {
-        vk = booster::robot::b1::VisualKickVersion::kV2;
-    }
+    if (verLower == "kv1" || verLower == "v1") vk = booster::robot::b1::VisualKickVersion::kV1;
+    else if (verLower == "kv2" || verLower == "v2") vk = booster::robot::b1::VisualKickVersion::kV2;
     body["version"] = static_cast<int>(vk);
     msg.body = body.dump();
-    std::cout << "RobotClient::RLVisionKick called with start=" << (start ? "true" : "false") << std::endl;
-    return call(msg);
+    const int result = call(msg);
+    if (result == 0) _visualKickActive = start;
+    return result;
 }
 
 int RobotClient::robocupWalk()
 {
-    std::cout << "RobotClient::robocupWalk exit VisualKick(false)" << std::endl;
-
-    // Only exit VisualKick mode; gait/mode switch is handled elsewhere.
     return RLVisionKick(false);
 }
 
 int RobotClient::changeRobocupMode()
 {
-    std::cout << "RobotClient::changeRobocupMode switch to kSoccer and exit VisualKick(false)" << std::endl;
-
+    if (!brain->isMotionAllowed()) return -1;
     int ret = call(booster_interface::CreateChangeModeMsg(booster::robot::RobotMode::kSoccer));
     if (ret != 0) return ret;
-
     return RLVisionKick(false);
 }
 
@@ -195,14 +229,29 @@ int RobotClient::enterDamping()
 
 int RobotClient::waveHand(bool doWaveHand)
 {
-    return call(booster_interface::CreateWaveHandMsg(booster::robot::b1::HandIndex::kRightHand, doWaveHand ? booster::robot::b1::HandAction::kHandOpen : booster::robot::b1::HandAction::kHandClose));
+    if (!brain->isMotionAllowed()) return -1;
+    return call(booster_interface::CreateWaveHandMsg(booster::robot::b1::HandIndex::kRightHand,
+        doWaveHand ? booster::robot::b1::HandAction::kHandOpen : booster::robot::b1::HandAction::kHandClose));
 }
 
 int RobotClient::setVelocity(double x, double y, double theta, bool applyMinX, bool applyMinY, bool applyMinTheta)
 {
-    brain->log->setTimeNow();
-    brain->log->log("RobotClient/setVelocity_in",
-                    rerun::TextLog(format("vx: %.2f  vy: %.2f  vtheta: %.2f", x, y, theta)));
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(theta)) {
+        stopMotion();
+        return -1;
+    }
+    if ((x != 0.0 || y != 0.0 || theta != 0.0) && !brain->isMotionAllowed()) {
+        stopMotion();
+        return -1;
+    }
+
+    const bool logMotionVisuals = brain->config->rerunLogEnableTCP || brain->config->rerunLogEnableFile;
+    if (logMotionVisuals) {
+        brain->log->setTimeNow();
+        brain->log->log("RobotClient/setVelocity_in",
+                        rerun::TextLog(format("vx: %.2f  vy: %.2f  vtheta: %.2f", x, y, theta)));
+    }
+
 
     // rerun::Collection<rerun::Vec2D> vxLine = {{0, 0}, {x, 0}};
     // rerun::Collection<rerun::Vec2D> vyLine = {{0, 0}, {0, -y}};
@@ -232,66 +281,49 @@ int RobotClient::setVelocity(double x, double y, double theta, bool applyMinX, b
     // brain->log->log("RobotClient/velocity_out/theta", rerun::Scalar(theta));
     
     // log simulated path based on velocity
-    vector<Pose2D> path = {{0, 0, 0}}; // 坐标系是以机器人的位置为 0,0, linear 速度方向为 theta = 0 的坐标系
-    double v = norm(x, y);
-    double simStep = 1e-1; double simLength = 5.;
-    for (int i = 0; i < simLength/simStep; i++) {
-        double dt = simStep * (i + 1);
-        if (fabs(theta) < 1e-3) path.push_back({v * dt, 0, 0});
-        else path.push_back({v/theta * sin(theta * dt), v/theta * (1 - cos(theta * dt)), theta * dt});
-    }
-    vector<Pose2D> path_f = {};
-    for (int i = 0; i < path.size(); i++) {
-        auto p = trans(
-            path[i].x, path[i].y, path[i].theta, 
-            brain->data->robotPoseToField.x, 
-            brain->data->robotPoseToField.y, 
-            brain->data->robotPoseToField.theta + atan2(y, x), 
-            "back"
-        );
-        path_f.push_back({p[0], -p[1], -p[2]});
-    }
-    
-    vector<rerun::components::Vector2D> vectors = {};
-    vector<rerun::components::Position2D> origins = {};
-    vector<rerun::components::Color> colors;
-    for (int i = 1; i < path_f.size(); i++) {
-        auto p0 = path_f[i-1];
-        auto p1 = path_f[i];
-        origins.push_back({p0.x, p0.y});
-        vectors.push_back({p1.x - p0.x, p1.y - p0.y});
-        colors.push_back({0, 0, 255 * (1 - i / path_f.size() / 2.0)});
-    }
-
-    // brain->log->log(
-    //     "field/projected_path",
-    //     rerun::Arrows2D::from_vectors(vectors)
-    //         .with_origins(origins)
-    //         .with_colors(colors)
-    //         .with_radii(0.005)
-    //         .with_draw_order(40)
-    // );
-    if (path_f.size() > 0) {
-        auto p = path_f[0];
-        brain->log->log(
-            "field/velocity",
-            rerun::Arrows2D::from_vectors({{v * cos(p.theta), v * sin(p.theta)}})
-                .with_origins({{p.x, p.y}})
+    if (logMotionVisuals) {
+        const auto &pose = brain->data->robotPoseToField;
+        const double vxField = x * cos(pose.theta) - y * sin(pose.theta);
+        const double vyField = x * sin(pose.theta) + y * cos(pose.theta);
+        brain->log->log("field/velocity",
+            rerun::Arrows2D::from_vectors({{vxField, -vyField}})
+                .with_origins({{pose.x, -pose.y}})
                 .with_colors(0xCCCCCCFF)
                 .with_radii(0.005)
-                .with_draw_order(40)
-        );
+                .with_draw_order(40));
+        brain->log->log("RobotClient/setVelocity_out",
+            rerun::TextLog(format("vx: %.2f  vy: %.2f  vtheta: %.2f", x, y, theta)));
     }
-    // prtWarn(format("path_f size: %d", path_f.size()));
-    _vx = x; _vy = y; _vtheta = theta; // remember last command. 可以近似作为当前机器人的速度使用. 
-    _lastCmdTime = brain->get_clock()->now();
-    if (fabs(_vx) > 1e-3 || fabs(_vy) > 1e-3 || fabs(_vtheta) > 1e-3) _lastNonZeroCmdTime = brain->get_clock()->now();
-    brain->log->log("RobotClient/setVelocity_out",
-        rerun::TextLog(format("vx: %.2f  vy: %.2f  vtheta: %.2f", x, y, theta)));
-    return call(booster_interface::CreateMoveMsg(x, y, theta));
+    const int result = call(booster_interface::CreateMoveMsg(x, y, theta));
+    if (result == 0) {
+        _vx = x; _vy = y; _vtheta = theta;
+        _lastCmdTime = brain->get_clock()->now();
+        if (fabs(_vx) > 1e-3 || fabs(_vy) > 1e-3 || fabs(_vtheta) > 1e-3) {
+            _lastNonZeroCmdTime = brain->get_clock()->now();
+        }
+        _stopMotionActive = (_vx == 0.0 && _vy == 0.0 && _vtheta == 0.0);
+    }
+    return result;
+}
+
+int RobotClient::stopMotion()
+{
+    int result = 0;
+    if (!_stopMotionActive) {
+        result = setVelocity(0.0, 0.0, 0.0, false, false, false);
+        if (result == 0) _stopMotionActive = true;
+    }
+    auto cancelIfActive = [&result](int cancelResult) {
+        if (result == 0 && cancelResult != 0) result = cancelResult;
+    };
+    if (_visualKickActive) cancelIfActive(RLVisionKick(false));
+    if (_rlKickActive) cancelIfActive(kickBall(0.0, 0.0, true));
+    if (_fancyKickActive) cancelIfActive(fancyKickBall(0.0, 0.0, true));
+    return result;
 }
 
 int RobotClient::crabWalk(double angle, double speed) {
+    if (!std::isfinite(angle) || !std::isfinite(speed)) return -1;
     double vxFactor = brain->config->vxFactor;   // 用于调整 vx, vx *= vxFactor, 以补偿 x, y 方向的速度参数与实际速度比例的偏差, 使运动方向准确
     double yawOffset = brain->config->yawOffset; // 用于补偿定位角度的偏差
     double vxLimit = brain->config->vxLimit;
@@ -317,6 +349,8 @@ bool RobotClient::isStandingStill(double timeBuffer) {
 }
 
 int RobotClient::moveToPoseOnField(double tx, double ty, double ttheta, double longRangeThreshold, double turnThreshold, double vxLimit, double vyLimit, double vthetaLimit, double xTolerance, double yTolerance, double thetaTolerance, bool avoidObstacle) {
+    if (!brain->isMotionAllowed()) { stopMotion(); return -1; }
+    if (!std::isfinite(tx) || !std::isfinite(ty) || !std::isfinite(ttheta)) { stopMotion(); return -1; }
     Pose2D target_f, target_r; // 移动目标在 field 和 robot 坐标系中的 Pose
     static Pose2D target_temp_r; // 用于避障的 temp_target
     static rclcpp::Time timeEndTempTarget = brain->get_clock()->now(); // 在此时间之前, 执行 temp_target, 而不是真正的 target
@@ -423,6 +457,8 @@ int RobotClient::moveToPoseOnField(double tx, double ty, double ttheta, double l
 }
 
 int RobotClient::moveToPoseOnField2(double tx, double ty, double ttheta, double longRangeThreshold, double turnThreshold, double vxLimit, double vyLimit, double vthetaLimit, double xTolerance, double yTolerance, double thetaTolerance, bool avoidObstacle) {
+    if (!brain->isMotionAllowed()) { stopMotion(); return -1; }
+    if (!std::isfinite(tx) || !std::isfinite(ty) || !std::isfinite(ttheta)) { stopMotion(); return -1; }
     static string mode = "longRange";
     static bool isBacking = false;
     static rclcpp::Time timeEndAvoid = brain->get_clock()->now();
@@ -561,6 +597,8 @@ int RobotClient::moveToPoseOnField2(double tx, double ty, double ttheta, double 
 }
 
 int RobotClient::moveToPoseOnField3(double tx, double ty, double ttheta, double longRangeThreshold, double turnThreshold, double vxLimit, double vyLimit, double vthetaLimit, double xTolerance, double yTolerance, double thetaTolerance, bool avoidObstacle) {
+    if (!brain->isMotionAllowed()) { stopMotion(); return -1; }
+    if (!std::isfinite(tx) || !std::isfinite(ty) || !std::isfinite(ttheta)) { stopMotion(); return -1; }
     static string mode = "longRange";
     static bool should_avoid_in_move = false;
     bool isFreekickStartPlacing = brain->isFreekickStartPlacing();

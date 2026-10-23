@@ -21,7 +21,7 @@ def print_usage() -> None:
     print("用法: python configure_demo.py")
     print()
     print("交互式快捷修改以下配置:")
-    print("  src/brain/config/config.yaml: team_id, player_id, number_of_players, game_control_ip")
+    print("  src/brain/config/config.yaml: team_id, player_id, number_of_players, goalkeeper_id, game_control_ip")
     print("  src/k1_robot_webui_client/config/webui_client.yaml: server_base_url")
     print("  src/game_controller/launch/launch.py: ip_white_list")
 
@@ -137,7 +137,8 @@ def main() -> int:
 
     current_team_id = find_yaml_value(brain_text, "team_id", "66")
     current_player_id = find_yaml_value(brain_text, "player_id", "1")
-    current_players = find_yaml_value(brain_text, "number_of_players", "5")
+    current_players = find_yaml_value(brain_text, "number_of_players", "3")
+    current_goalkeeper = find_yaml_value(brain_text, "goalkeeper_id", "3")
     current_gc_ip = find_yaml_value(brain_text, "game_control_ip", find_launch_ip(launch_text, "192.168.74.2"))
     current_server = find_server_url(webui_text)
 
@@ -145,9 +146,10 @@ def main() -> int:
     print(f"工作目录: {ROOT}")
     print()
 
-    team_id = ask_int("team_id", current_team_id, minimum=0)
-    player_id = ask_int("player_id", current_player_id, minimum=1, maximum=5)
-    number_of_players = ask_int("number_of_players", current_players, minimum=1, maximum=5)
+    team_id = ask_int("team_id", current_team_id, minimum=1, maximum=254)
+    number_of_players = ask_int("number_of_players", current_players, minimum=1, maximum=11)
+    player_id = ask_int("player_id", current_player_id, minimum=1, maximum=int(number_of_players))
+    goalkeeper_id = ask_int("goalkeeper_id (全队一致)", current_goalkeeper, minimum=1, maximum=int(number_of_players))
     game_control_ip = ask_value("GameController IP", current_gc_ip)
     server_base_url = normalize_server_url(ask_value("Windows WebUI 后端 IP 或 URL", current_server))
 
@@ -156,6 +158,7 @@ def main() -> int:
     print(f"  team_id: {team_id}")
     print(f"  player_id: {player_id}")
     print(f"  number_of_players: {number_of_players}")
+    print(f"  goalkeeper_id: {goalkeeper_id}")
     print(f"  game_control_ip / ip_white_list: {game_control_ip}")
     print(f"  server_base_url: {server_base_url}")
     confirm = input("继续 [Y/n]: ").strip().lower()
@@ -167,6 +170,7 @@ def main() -> int:
     new_brain = replace_yaml_scalar(new_brain, "team_id", team_id)
     new_brain = replace_yaml_scalar(new_brain, "player_id", player_id)
     new_brain = replace_yaml_scalar(new_brain, "number_of_players", number_of_players)
+    new_brain = replace_yaml_scalar(new_brain, "goalkeeper_id", goalkeeper_id)
     new_brain = replace_yaml_scalar(new_brain, "game_control_ip", game_control_ip, quoted=True)
 
     new_webui = replace_yaml_scalar(webui_text, "server_base_url", server_base_url, quoted=True)

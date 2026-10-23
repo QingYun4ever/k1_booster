@@ -4,6 +4,19 @@
 BrainData::BrainData()
 {
     std::fill(std::begin(penalty), std::end(penalty), SUBSTITUTE);
+    std::fill(std::begin(oppoPenalty), std::end(oppoPenalty), SUBSTITUTE);
+    ball = GameObject{};
+    tmBall = GameObject{};
+    filteredBall = GameObject{};
+    predictedBall = GameObject{};
+    robotPoseToField = Pose2D{};
+    robotPoseToOdom = Pose2D{};
+    odomToField = Pose2D{};
+    interceptBall = GameObject{};
+    headPitch = 0.0;
+    headYaw = 0.0;
+    robotBallAngleToField = 0.0;
+    std::fill(std::begin(receiveId), std::end(receiveId), 0);
 }
 
 vector<GameObject> BrainData::getMarkingsByType(set<string> types) {

@@ -6,6 +6,9 @@
 #include <iomanip>
 #include <sstream>
 #include <yaml-cpp/yaml.h>  // 添加这一行
+#include <chrono>
+#include <filesystem>
+#include <limits>
 
 #include "brain.h"
 #include "utils/print.h"
@@ -229,13 +232,15 @@ Brain::Brain() : rclcpp::Node("brain_node")
     // 配置在 yaml 文件中的参数，如果有层级结构，用点分号来获取
 
     declare_parameter<int>("game.team_id", 0);
-    declare_parameter<int>("game.player_id", 29);
+    declare_parameter<int>("game.player_id", 1);
     declare_parameter<string>("game.field_type", "");
 
     declare_parameter<string>("game.player_role", "");
     declare_parameter<string>("game.player_start_pos", "left");
     declare_parameter<bool>("game.treat_person_as_robot", false);
-    declare_parameter<int>("game.number_of_players", 2);
+    declare_parameter<int>("game.number_of_players", 3);
+    declare_parameter<int>("game.goalkeeper_id", 3);
+    declare_parameter<double>("game.controller_timeout_ms", 2000.0);
 
     declare_parameter<double>("robot.robot_height", 1.0);
     declare_parameter<double>("robot.odom_factor", 1.0);
@@ -251,6 +256,13 @@ Brain::Brain() : rclcpp::Node("brain_node")
     declare_parameter<bool>("strategy.limit_near_ball_speed", true);
     declare_parameter<double>("strategy.near_ball_speed_limit", 0.3);
     declare_parameter<double>("strategy.near_ball_range", 4.0);
+    declare_parameter<double>("strategy.kick_range", 1.0);
+    declare_parameter<double>("strategy.kick_theta_range", 0.2);
+    declare_parameter<bool>("strategy.soft_kickoff", true);
+    declare_parameter<double>("strategy.soft_kickoff_speed", 0.3);
+    declare_parameter<double>("strategy.abort_kick_ball_move_threshold", 0.3);
+    declare_parameter<double>("strategy.ball_confidence_decay_rate", 3.0);
+    declare_parameter<bool>("strategy.enable_stable_kick", false);
     declare_parameter<bool>("strategy.abort_kick_when_ball_moved", false);
     declare_parameter<bool>("strategy.enable_bypass", false);
     declare_parameter<bool>("strategy.enable_shoot", false);
@@ -309,14 +321,8 @@ Brain::Brain() : rclcpp::Node("brain_node")
     declare_parameter<double>("strategy.shoot.xmax", 1.0);
     declare_parameter<double>("strategy.shoot.ymin", -0.5);
     declare_parameter<double>("strategy.shoot.ymax", 0.5);
-    declare_parameter<bool>("strategy.cooperation.enable_role_switch", true);
-    declare_parameter<double>("strategy.cooperation.ball_control_cost_threshold", 10.0);
-
-    // 身份判定 (方案任务2)
-    declare_parameter<bool>("strategy.role_assignment.enable", false);
+    declare_parameter<double>("strategy.cooperation.owner_switch_margin", 0.3);
     declare_parameter<bool>("strategy.role_assignment.gk_takeover", true);
-    declare_parameter<double>("strategy.role_assignment.lead_hold_msecs", 500.0);
-    declare_parameter<double>("strategy.role_assignment.handover_confirm_timeout_msecs", 2000.0);
 
     // 开球触球前禁 vision kick (方案任务1)
     declare_parameter<bool>("strategy.kickoff_guard.enable", false);
@@ -353,6 +359,7 @@ Brain::Brain() : rclcpp::Node("brain_node")
     declare_parameter<bool>("obstacle_avoidance.avoid_during_kick", false);
     declare_parameter<double>("obstacle_avoidance.kick_ao_safe_dist", 1.0);
     declare_parameter<bool>("obstacle_avoidance.kick_ao_use_shoot", false);
+    declare_parameter<bool>("obstacle_avoidance.always_turn_left", false);
     
     declare_parameter<int>("locator.min_marker_count", 5);
     declare_parameter<double>("locator.max_residual", 0.3);
@@ -403,7 +410,13 @@ Brain::Brain() : rclcpp::Node("brain_node")
 
 Brain::~Brain()
 {
-
+    if (client && rclcpp::ok()) {
+        try {
+            client->stopMotion();
+        } catch (const std::exception &error) {
+            std::cerr << "motion cancellation during shutdown failed: " << error.what() << '\n';
+        }
+    }
 }
 
 void Brain::init()
@@ -411,6 +424,7 @@ void Brain::init()
     
     config = std::make_shared<BrainConfig>();
     loadConfig();
+    gameTree_ = std::filesystem::path(config->treeFilePath).stem() == "game";
 
     data = std::make_shared<BrainData>();
     k1_ball_predictor::Config ballPredictorConfig;
@@ -465,6 +479,7 @@ void Brain::init()
 
    
     tree->init();
+    if (std::filesystem::path(config->treeFilePath).stem() == "game") tree->setEntry<int>("control_state", 3);
 
    
     client->init();
@@ -476,10 +491,10 @@ void Brain::init()
     communication->initCommunication();
 
     data->lastSuccessfulLocalizeTime = get_clock()->now();
-    data->timeLastDet = get_clock()->now();
-    data->timeLastLineDet = get_clock()->now();
-    data->timeLastGamecontrolMsg = get_clock()->now();
-    data->ball.timePoint = get_clock()->now();
+    data->timeLastDet = rclcpp::Time(0, 0, get_clock()->get_clock_type());
+    data->timeLastLineDet = rclcpp::Time(0, 0, get_clock()->get_clock_type());
+    data->timeLastGamecontrolMsg = rclcpp::Time(0, 0, get_clock()->get_clock_type());
+    data->ball.timePoint = rclcpp::Time(0, 0, get_clock()->get_clock_type());
 
     
     auto now = get_clock()->now();
@@ -487,8 +502,6 @@ void Brain::init()
         data->tmStatus[i].isAlive = false;
         data->tmStatus[i].timeLastCom = now;
     }
-    data->tmLastCmdChangeTime = now;
-    data->tmLastLeadFlipTime = now;
     data->kickoffGuardWindowStart = now;
 
    
@@ -510,6 +523,11 @@ void Brain::init()
     pubSpeak = create_publisher<std_msgs::msg::String>("/speak", 10);
     pubKickBall = create_publisher<brain::msg::Kick>("/kick_ball", 10);
     pubWebuiStatus = create_publisher<std_msgs::msg::String>("/brain/status_json", 10);
+    gameControlSubscription = create_subscription<game_controller_interface::msg::GameControlData>(
+        "/robocup/game_controller", 1, bind(&Brain::gameControlCallback, this, _1));
+    remoteControllerSubscription = create_subscription<booster_interface::msg::RemoteControllerState>(
+        "/remote_controller_state", 1, bind(&Brain::joystickCallback, this, _1));
+    timer_ = create_wall_timer(std::chrono::milliseconds(10), bind(&Brain::tick, this));
 }
 
 void Brain::loadConfig()
@@ -521,6 +539,8 @@ void Brain::loadConfig()
     get_parameter("game.player_start_pos", config->playerStartPos);
     get_parameter("game.treat_person_as_robot", config->treatPersonAsRobot);
     get_parameter("game.number_of_players", config->numOfPlayers);
+    get_parameter("game.goalkeeper_id", config->goalkeeperId);
+    get_parameter("game.controller_timeout_ms", config->gameControllerTimeoutMs);
 
     get_parameter("robot.robot_height", config->robotHeight);
     get_parameter("robot.odom_factor", config->robotOdomFactor);
@@ -531,6 +551,8 @@ void Brain::loadConfig()
     get_parameter("robot.vtheta_limit", config->vthetaLimit);
 
     get_parameter("strategy.ball_confidence_threshold", config->ballConfidenceThreshold);
+    get_parameter("strategy.ball_confidence_decay_rate", config->ballConfidenceDecayRate);
+    get_parameter("strategy.enable_stable_kick", config->enableStableKick);
     get_parameter("strategy.tm_ball_dist_threshold", config->tmBallDistThreshold);
     get_parameter("strategy.limit_near_ball_speed", config->limitNearBallSpeed);
     get_parameter("strategy.near_ball_speed_limit", config->nearBallSpeedLimit);
@@ -657,23 +679,69 @@ void Brain::loadConfig()
 
 void Brain::tick()
 {
-    // 输出 debug & log 相关信息
-    logDebugInfo();
-    // logObstacleDistance(); // 计算量大, 仅需要时使用
-    logLags();
-    statusReport();
-    logStatusToConsole();
-    playSoundForFun();
-    updateLogFile();
-    
+    communication->update();
     updateMemory();
     handleSpecialStates();
     handleCooperation();
-
-    pubKickMsg();
-
+    if (!isMotionAllowed()) {
+        tree->halt();
+        client->stopMotion();
+        data->tmImInVisualKick = false;
+    }
+    // SET still permits non-motion localization; RobotClient gates every output.
     tree->tick();
+    pubKickMsg();
+    communication->update();
+    logDebugInfo();
+    logLags();
+    statusReport();
+    logStatusToConsole();
+    updateLogFile();
     publishWebuiStatus();
+}
+
+bool Brain::isMotionAllowed() const
+{
+    return isRecoveryAllowed() && data->recoveryState == RobotRecoveryState::IS_READY;
+}
+
+bool Brain::isRecoveryAllowed() const
+{
+    if (!config || !data || !tree) return false;
+    const bool autonomous = gameTree_ && tree->getEntry<int>("control_state") == 3 &&
+        !tree->getEntry<bool>("go_manual");
+    const auto now = get_clock()->now();
+    const double age = data->timeLastGamecontrolMsg.get_clock_type() == now.get_clock_type()
+        ? (now - data->timeLastGamecontrolMsg).nanoseconds() / 1e6 : 1e18;
+    return match_policy::canMove(matchState_, data->gcReceived, age,
+        config->gameControllerTimeoutMs, autonomous);
+}
+
+bool Brain::hasFreshLocalBall(double maxAgeMs) const
+{
+    if (!data || !config || !data->ballDetected || !std::isfinite(maxAgeMs) || maxAgeMs < 0.0)
+        return false;
+    const auto now = get_clock()->now();
+    const auto &ball = data->ball;
+    if (ball.timePoint.nanoseconds() <= 0 || ball.timePoint.get_clock_type() != now.get_clock_type())
+        return false;
+    const double age = (now - ball.timePoint).nanoseconds() / 1e6;
+    return age >= 0.0 && age <= maxAgeMs && std::isfinite(ball.confidence) &&
+        ball.confidence >= config->ballConfidenceThreshold && ball.confidence <= 100.0 &&
+        std::isfinite(ball.range) && ball.range > 0.05 &&
+        std::isfinite(ball.posToRobot.x) && std::isfinite(ball.posToRobot.y) &&
+        std::isfinite(ball.posToField.x) && std::isfinite(ball.posToField.y);
+}
+
+bool Brain::isKickAllowed() const
+{
+    if (!isMotionAllowed() || !hasFreshLocalBall() || !data->tmImLead ||
+        !tree->getEntry<bool>("odom_calibrated") || data->recoveryState != RobotRecoveryState::IS_READY ||
+        tree->getEntry<bool>("ball_out") || tree->getEntry<bool>("wait_for_opponent_kickoff")) return false;
+    const auto now = get_clock()->now();
+    const double age = data->gcReceived ? (now - data->timeLastGamecontrolMsg).nanoseconds() / 1e6 : 0.0;
+    return match_policy::canKick(matchState_, data->gcReceived, age,
+        config->gameControllerTimeoutMs, false);
 }
 
 void Brain::publishWebuiStatus() {
@@ -763,6 +831,13 @@ string Brain::buildWebuiStatusJson() {
     oss << ",\"is_sub_state_kickoff_side\":" << (tree->getEntry<bool>("gc_is_sub_state_kickoff_side") ? "true" : "false");
     oss << ",\"under_penalty\":" << (tree->getEntry<bool>("gc_is_under_penalty") ? "true" : "false");
     oss << ",\"self_penalty\":" << selfPenalty;
+    oss << ",\"gc_received\":" << (data->gcReceived ? "true" : "false");
+    oss << ",\"stopped\":" << (data->gcStopped ? "true" : "false");
+    oss << ",\"protocol_version\":" << data->gcProtocolVersion;
+    oss << ",\"game_phase\":" << data->gcGamePhase;
+    oss << ",\"set_play\":" << data->gcSetPlay;
+    oss << ",\"secondary_time\":" << data->gcSecondaryTime;
+    oss << ",\"ball_owner_id\":" << data->ballOwnerId;
     oss << ",\"score\":" << data->score;
     oss << ",\"oppo_score\":" << data->oppoScore;
     oss << ",\"live_count\":" << data->liveCount;
@@ -928,8 +1003,7 @@ string Brain::buildWebuiStatusJson() {
 }
 
 void Brain::pubKickMsg() {
-    if (!pubKickBall) return;
-    if (!data->ballDetected) return;
+    if (!pubKickBall || !isKickAllowed() || data->kickoffGuardActive || !data->tmImInVisualKick) return;
     brain::msg::Kick kickMsg;
     kickMsg.header.stamp = get_clock()->now();
     kickMsg.x = data->ball.posToRobot.x;
@@ -941,6 +1015,7 @@ void Brain::pubKickMsg() {
     Pose2D goalPose;
     goalPose.x = goal_x;
     goalPose.y = goal_y;
+    goalPose.theta = 0.0;
     double ball_x = data->ball.posToField.x;
     double ball_y = data->ball.posToField.y;
     double dist = std::sqrt((goal_x - ball_x) * (goal_x - ball_x) + (goal_y - ball_y) * (goal_y - ball_y));
@@ -960,587 +1035,210 @@ void Brain::pubKickMsg() {
     kickMsg.goal_y = goalPose_r.y;
 
     kickMsg.robot_theta_to_field = data->robotPoseToField.theta;
+    if (!std::isfinite(kickMsg.dir) || !std::isfinite(kickMsg.power) ||
+        !std::isfinite(kickMsg.goal_x) || !std::isfinite(kickMsg.goal_y)) return;
 
     pubKickBall->publish(kickMsg);
 }
 
-void Brain::handleSpecialStates() {
-
-    const double KICKOFF_DURATION = 10.0; 
-    string gameState = tree->getEntry<string>("gc_game_state");
-    bool isKickoffSide = tree->getEntry<bool>("gc_is_kickoff_side");
-    string gameSubStateType = tree->getEntry<string>("gc_game_sub_state_type");
-    string gameSubState = tree->getEntry<string>("gc_game_sub_state");
-    bool isFreekickKickoffSide = tree->getEntry<bool>("gc_is_sub_state_kickoff_side");
-    auto now = get_clock()->now();
-
-    if (gameState == "SET" && isKickoffSide) {
+void Brain::handleSpecialStates()
+{
+    const auto now = get_clock()->now();
+    const auto gameState = tree->getEntry<string>("gc_game_state");
+    const bool ownPrimaryPrep = gameState == "SET" && matchState_.ownKickoff;
+    const bool ownRestart = matchState_.restart != match_policy::Restart::None && matchState_.ownRestart;
+    const bool restartNeedsTouch = matchState_.restart == match_policy::Restart::Indirect ||
+        matchState_.restart == match_policy::Restart::ThrowIn || matchState_.restart == match_policy::Restart::GoalKick ||
+        matchState_.restart == match_policy::Restart::Corner;
+    const bool ownRestartPrep = ownRestart && restartNeedsTouch && matchState_.stopped;
+    if (ownPrimaryPrep) {
         data->isKickingOff = true;
         data->kickoffStartTime = now;
-    } else if (msecsSince(data->kickoffStartTime) > KICKOFF_DURATION * 1000) {
+    } else if (gameState != "PLAY" || msecsSince(data->kickoffStartTime) > 10000.0) {
         data->isKickingOff = false;
     }
-
-    if (gameState == "PLAY" && gameSubStateType == "FREE_KICK" && isFreekickKickoffSide) {
-        data->isFreekickKickingOff = true;
-        data->freekickKickoffStartTime = now;
-    } else if (msecsSince(data->freekickKickoffStartTime) > KICKOFF_DURATION * 1000) {
-        data->isFreekickKickingOff = false;
-        data->isDirectShoot = false;
-    }
-
-    static int lastScore = 0;
-    if (data->score > lastScore) {
-        tree->setEntry<bool>("we_just_scored", true);
-        lastScore = data->score;
-    }
-    if (gameState == "SET") {
-        tree->setEntry<bool>("we_just_scored", false);
-    }
-
-    // ===== kickoff_guard (方案任务1): 我方开球后、第一脚触球(球移动)前, 禁用 vision kick =====
-    // 规则依据: 开球第一脚射门不算进球, 必须先触球; vision kick 力度大且不受代码接管, 故触球前必须屏蔽.
-    // 触球判定: 球在 field 系的位移超过阈值 (定位与测距可信的帧才参与判定).
-    bool guardEnable = false;
-    get_parameter("strategy.kickoff_guard.enable", guardEnable);
-    // 摆位/等待阶段: 中场开球的 SET 阶段, 或我方任意球的整个 FREE_KICK 二级状态期间
-    bool inKickoffPrep = (gameState == "SET" && isKickoffSide)
-        || (gameState == "PLAY" && gameSubStateType == "FREE_KICK" && isFreekickKickoffSide);
-
-    if (!guardEnable) {
+    data->isFreekickKickingOff = ownRestart && gameState == "PLAY";
+    if (ownRestartPrep) data->freekickKickoffStartTime = now;
+    if (data->score > lastScore_) tree->setEntry<bool>("we_just_scored", true);
+    lastScore_ = data->score;
+    if (gameState == "SET") tree->setEntry<bool>("we_just_scored", false);
+    if (matchState_.restart == match_policy::Restart::Penalty || matchState_.phase == match_policy::Phase::PenaltyShootout) {
         data->kickoffGuardActive = false;
         data->kickoffGuardBallLocked = false;
-        data->kickoffGuardMoveConfirmCount = 0;
-    } else {
-        bool ballReliable = data->ballDetected
-            && data->ball.confidence >= config->ballConfidenceThreshold
-            && tree->getEntry<bool>("odom_calibrated");
+    }
 
-        if (inKickoffPrep) {
-            // 摆位期间: 持续刷新窗口起点并保持 guard; 持续用可信帧更新基准球位
-            // (对应方案"开球前实时确认球是否动了": 裁判挪球等情况下基准随之更新)
-            data->kickoffGuardActive = true;
-            data->kickoffGuardWindowStart = now;
-            if (ballReliable) {
+    if (!get_parameter("strategy.kickoff_guard.enable").as_bool()) {
+        data->kickoffGuardActive = false;
+        data->kickoffGuardBallLocked = false;
+        return;
+    }
+    const bool newObservation = hasFreshLocalBall() && tree->getEntry<bool>("odom_calibrated") &&
+        data->ball.timePoint != data->kickoffGuardLastObservation;
+    if (ownPrimaryPrep || ownRestartPrep) {
+        data->kickoffGuardActive = true;
+        data->kickoffGuardWindowStart = now;
+        if (newObservation) {
+            data->kickoffGuardBallPos = data->ball.posToField;
+            data->kickoffGuardOdomToField = data->odomToField;
+            data->kickoffGuardBallLocked = true;
+            data->kickoffGuardMoveConfirmCount = 0;
+        }
+    } else if (data->kickoffGuardActive) {
+        if (gameState != "PLAY") {
+            data->kickoffGuardActive = false;
+            data->kickoffGuardBallLocked = false;
+        } else if (newObservation) {
+            const double jump = norm(data->odomToField.x - data->kickoffGuardOdomToField.x,
+                data->odomToField.y - data->kickoffGuardOdomToField.y);
+            const double yawJump = fabs(toPInPI(data->odomToField.theta - data->kickoffGuardOdomToField.theta));
+            if (!data->kickoffGuardBallLocked ||
+                jump > get_parameter("strategy.kickoff_guard.localization_jump_threshold").as_double() || yawJump > 0.15) {
                 data->kickoffGuardBallPos = data->ball.posToField;
                 data->kickoffGuardOdomToField = data->odomToField;
                 data->kickoffGuardBallLocked = true;
                 data->kickoffGuardMoveConfirmCount = 0;
-            }
-        } else if (data->kickoffGuardActive) {
-            if (gameState != "PLAY" || msecsSince(data->kickoffGuardWindowStart) > KICKOFF_DURATION * 1000) {
-                // 离开比赛状态, 或开球窗口超时: 解除
-                data->kickoffGuardActive = false;
-                data->kickoffGuardBallLocked = false;
-                data->kickoffGuardMoveConfirmCount = 0;
-            } else if (ballReliable) {
-                if (!data->kickoffGuardBallLocked) {
-                    // 摆位期间没拿到可信球位, 用进入比赛后的首个可信帧锁存
-                    data->kickoffGuardBallPos = data->ball.posToField;
-                    data->kickoffGuardOdomToField = data->odomToField;
-                    data->kickoffGuardBallLocked = true;
-                    data->kickoffGuardMoveConfirmCount = 0;
-                } else {
-                    double moveThreshold = 0.3;
-                    get_parameter("strategy.kickoff_guard.ball_move_threshold", moveThreshold);
-                    int requiredConfirmFrames = 3;
-                    get_parameter("strategy.kickoff_guard.move_confirm_frames", requiredConfirmFrames);
-                    requiredConfirmFrames = max(requiredConfirmFrames, 1);
-                    double localizationJumpThreshold = 0.25;
-                    get_parameter("strategy.kickoff_guard.localization_jump_threshold", localizationJumpThreshold);
-                    double threshold = max(0.15 * data->ball.range, moveThreshold);
-                    double moved = norm(data->ball.posToField.x - data->kickoffGuardBallPos.x,
-                                        data->ball.posToField.y - data->kickoffGuardBallPos.y);
-                    double localizationShift = norm(data->odomToField.x - data->kickoffGuardOdomToField.x,
-                                                    data->odomToField.y - data->kickoffGuardOdomToField.y);
-                    if (localizationShift > localizationJumpThreshold) {
-                        // field 坐标发生明显整体修正时，静止球也会看似移动；重新建立稳定基准。
-                        data->kickoffGuardBallPos = data->ball.posToField;
-                        data->kickoffGuardOdomToField = data->odomToField;
-                        data->kickoffGuardMoveConfirmCount = 0;
-                        log->setTimeNow();
-                        log->log("debug/kickoff_guard", rerun::TextLog(format(
-                            "relocked after localization shift %.2f > %.2f", localizationShift, localizationJumpThreshold)));
-                    } else if (moved > threshold) {
-                        data->kickoffGuardMoveConfirmCount++;
-                    } else {
-                        data->kickoffGuardMoveConfirmCount = 0;
-                    }
-                    if (data->kickoffGuardMoveConfirmCount >= requiredConfirmFrames) { // 第一脚触球完成
-                        data->kickoffGuardActive = false;
-                        data->kickoffGuardBallLocked = false;
-                        data->kickoffGuardMoveConfirmCount = 0;
-                        log->setTimeNow();
-                        log->log("debug/kickoff_guard", rerun::TextLog(format(
-                            "released: ball moved %.2f > %.2f for %d frames", moved, threshold, requiredConfirmFrames)));
-                    }
+            } else {
+                const double moved = norm(data->ball.posToField.x - data->kickoffGuardBallPos.x,
+                    data->ball.posToField.y - data->kickoffGuardBallPos.y);
+                const double threshold = std::max(0.15 * data->ball.range,
+                    get_parameter("strategy.kickoff_guard.ball_move_threshold").as_double());
+                data->kickoffGuardMoveConfirmCount = moved > threshold ? data->kickoffGuardMoveConfirmCount + 1 : 0;
+                if (data->kickoffGuardMoveConfirmCount >=
+                    std::max<int64_t>(1, get_parameter("strategy.kickoff_guard.move_confirm_frames").as_int())) {
+                    data->kickoffGuardActive = false;
+                    data->kickoffGuardBallLocked = false;
                 }
             }
         }
     }
+    if (newObservation) data->kickoffGuardLastObservation = data->ball.timePoint;
 }
 
-void Brain::handleCooperation() {
-    auto log_ = [=](string msg) {
-        log->setTimeNow();
-        log->log("debug/handleCooperation", rerun::TextLog(msg));
-    };
-    log_("handle cooperation");
-
-    const int CMD_COOLDOWN = 2000; 
-    const int COM_TIMEOUT = 5000; 
-
-    int selfId = config->playerId;
-    int selfIdx = selfId - 1;
-    int numOfPlayers = config->numOfPlayers;
-
-    vector<int> aliveTmIdxs = {}; 
-
-
-    data->tmImAlive = 
-        (data->penalty[selfIdx] == PENALTY_NONE) 
-        && tree->getEntry<bool>("odom_calibrated"); 
-    updateCostToKick(); 
-    log_(format("ImAlive: %d, myCost: %.1f", data->tmImAlive, data->tmMyCost));
-
-    
-    int gcAliveCount = 0; 
-    for (int i = 0; i < HL_MAX_NUM_PLAYERS; i++)
-    {
-        if (data->penalty[i] == PENALTY_NONE) {
-            gcAliveCount++;
-
-            int tmId = i + 1;
-            if (tmId == config->playerId) continue;
-
-            auto tmStatus = data->tmStatus[i];
-            log->setTimeNow();
-            auto color = 0x00FFFFFF;
-            if (!tmStatus.isAlive) color = 0x006666FF;
-            else if (!tmStatus.isLead) color = 0x00CCCCFF;
-            string label = format("ID: %d, Cost: %.1f", tmId, tmStatus.cost);
-            log->logRobot(format("field/teammate-%d", tmId).c_str(), tmStatus.robotPoseToField, color, label);
-            log->logBall(
-            format("tm_ball-%d", tmId).c_str(),
-            tmStatus.ballPosToField, 
-            tmStatus.ballDetected ? 0x00FFFFFF : (tmStatus.isAlive ? 0x006666FF : 0x003333FF),
-            tmStatus.ballConfidence,
-            tmStatus.ballLocationKnown
-            );
+void Brain::handleCooperation()
+{
+    const int count = data->gcReceived ? std::min(config->numOfPlayers, data->gcPlayersPerTeam)
+                                      : config->numOfPlayers;
+    const int self = config->playerId - 1;
+    const auto now = get_clock()->now();
+    std::array<bool, team_strategy::kCapacity> eligible{};
+    std::array<bool, team_strategy::kCapacity> online{};
+    for (int i = 0; i < count; ++i) {
+        eligible[i] = data->gcReceived ? data->penalty[i] == PENALTY_NONE : i == self;
+        if (i == self) continue;
+        auto &status = data->tmStatus[i];
+        const double age = msecsSince(status.timeLastCom);
+        online[i] = config->enableCom && eligible[i] && status.isAlive && age >= 0.0 && age <= 2200.0;
+        if (!online[i]) {
+            status.isAlive = false;
+            status.isLead = false;
+            status.isInVisualKick = false;
         }
     }
-    log_(format("gcAliveCnt: %d", gcAliveCount));
-
-    for (int i = 0; i < HL_MAX_NUM_PLAYERS; i++) {
-        if (i == selfIdx) continue; 
-
-        if (
-            data->penalty[i] != PENALTY_NONE 
-            || msecsSince(data->tmStatus[i].timeLastCom) > COM_TIMEOUT 
-        ) {
-            data->tmStatus[i].isAlive = false;
-            data->tmStatus[i].isLead = false;
-        }
-        
-        if (data->tmStatus[i].isAlive) {
-            aliveTmIdxs.push_back(i);
-            log->setTimeNow();
-            log->log(format("debug/tm_cost_scalar_%d", i + 1), rerun::Scalar(data->tmStatus[i].cost));
-            log->log(format("debug/tm_lead_scalar_%d", i + 1), rerun::Scalar(data->tmStatus[i].isLead));
-        }
+    data->tmImAlive = self < count && eligible[self] && tree->getEntry<bool>("odom_calibrated") &&
+        data->recoveryState == RobotRecoveryState::IS_READY;
+    online[self] = data->tmImAlive;
+    const int goalie = getEffectiveGoalkeeperId();
+    data->actingGoalieId = goalie > 0 && goalie != config->goalkeeperId ? goalie : -1;
+    if (data->gcReceived) {
+        tree->setEntry<string>("player_role", goalie == config->playerId ? "goal_keeper" : "striker");
+    } else {
+        tree->setEntry<string>("player_role", config->playerRole);
     }
-    log_(format("alive TM Count: %d", aliveTmIdxs.size()));
 
-    // log 当前 alive 队友的信息
-    log_(format("Self: cost: %.1f, isLead: %d", data->tmMyCost, data->tmImLead));
-
-
-    if (config->tmBallShareEnable && teammateBall) {
-        // ===== 新: 队友间高置信度球位置共享/融合 (逻辑封装在独立 package k1_teammate_ball) =====
-        // 传输仍复用上面已有的 UDP 通讯收到的 tmStatus; 这里只做"高置信度门控 + 选择/融合 + 超时保持"。
-        for (size_t i = 0; i < aliveTmIdxs.size(); i++) {
-            int idx = aliveTmIdxs[i];
-            const auto &status = data->tmStatus[idx];
-            k1_teammate_ball::BallReport r;
-            r.player_id = idx + 1;
-            r.x = status.ballPosToField.x;
-            r.y = status.ballPosToField.y;
-            r.confidence = status.ballConfidence;
-            r.range = status.ballRange;
-            r.detected = status.ballDetected;
-            r.location_known = status.ballLocationKnown;
-            r.robot_x = status.robotPoseToField.x;
-            r.robot_y = status.robotPoseToField.y;
-            r.stamp_sec = status.timeLastCom.seconds();
-            teammateBall->ingest(r);
+    data->tmBallShareActive = config->enableCom && config->tmBallShareEnable;
+    data->tmBallShareReliable = false;
+    data->tmBallShareFresh = false;
+    data->tmBallShareSourceId = 0;
+    data->tmBallShareConfidence = 0.0;
+    tree->setEntry<bool>("tm_ball_pos_reliable", false);
+    if (data->tmBallShareActive) {
+        for (int i = 0; i < count; ++i) {
+            if (i == self || !online[i]) continue;
+            const auto &status = data->tmStatus[i];
+            k1_teammate_ball::BallReport report;
+            report.player_id = i + 1;
+            report.x = status.ballPosToField.x;
+            report.y = status.ballPosToField.y;
+            report.confidence = status.ballConfidence;
+            report.range = status.ballRange;
+            report.detected = status.ballDetected;
+            report.location_known = status.ballLocationKnown;
+            report.robot_x = status.robotPoseToField.x;
+            report.robot_y = status.robotPoseToField.y;
+            report.stamp_sec = status.ballObservationTime.seconds();
+            teammateBall->ingest(report, now.seconds());
         }
-        auto fused = teammateBall->fuse(
-            data->robotPoseToField.x, data->robotPoseToField.y,
-            tree->getEntry<bool>("ball_location_known"),
-            get_clock()->now().seconds());
-        // 暴露融合结果给 WebUI 验证 (谁的球被采用/置信度/是否新鲜)
-        data->tmBallShareActive = true;
+        const auto fused = teammateBall->fuse(data->robotPoseToField.x, data->robotPoseToField.y,
+            tree->getEntry<bool>("odom_calibrated"), now.seconds());
         data->tmBallShareReliable = fused.reliable;
+        data->tmBallShareFresh = fused.is_fresh;
         data->tmBallShareSourceId = fused.source_player_id;
         data->tmBallShareConfidence = fused.confidence;
-        data->tmBallShareFresh = fused.is_fresh;
         if (fused.reliable) {
-            log_(format("[tmBallShare] reliable tm ball: PlayerID=%d conf=%.0f fresh=%d", fused.source_player_id, fused.confidence, fused.is_fresh));
-            data->tmBall.posToField.x = fused.x;
-            data->tmBall.posToField.y = fused.y;
+            data->tmBall.posToField = {fused.x, fused.y, 0.0};
+            data->tmBall.confidence = fused.confidence;
+            data->tmBall.timePoint = rclcpp::Time(static_cast<int64_t>(fused.source_stamp_sec * 1e9), now.get_clock_type());
             updateRelativePos(data->tmBall);
             tree->setEntry<bool>("tm_ball_pos_reliable", true);
-            if (!tree->getEntry<bool>("ball_location_known")) {
-                data->ball.posToField = data->tmBall.posToField;
-                updateRelativePos(data->ball);
-            }
-        } else {
-            log_("[tmBallShare] no reliable high-confidence tm ball");
-            tree->setEntry<bool>("tm_ball_pos_reliable", false);
-        }
-    } else {
-        // ===== 原有逻辑 (tmBallShareEnable=false 时保持不变): 仅按 ballDetected + 距离选最近队友球 =====
-        data->tmBallShareActive = false;
-        static rclcpp::Time lastTmBallPosTime = get_clock()->now();
-        const double TM_BALL_TIMEOUT = 1000.;
-        const double RANGE_THRESHOLD = config->tmBallDistThreshold;
-        int trustedTMIdx = -1;
-        double minRange = 1e6;
-        log_(format("Find ball info among %d alive TMs", aliveTmIdxs.size()));
-        for (int i = 0; i < aliveTmIdxs.size(); i++) {
-            auto status = data->tmStatus[aliveTmIdxs[i]];
-            log_(format("TM %d, ballDetected: %d, ballRange: %.1f", i + 1, status.ballDetected, status.ballRange));
-            if (status.ballDetected && status.ballRange < minRange) {
-                log_(format("tm ball range(%.1f) < minRange(%.1f)", status.ballRange, minRange));
-                double dist = norm(status.ballPosToField.x - data->robotPoseToField.x, status.ballPosToField.y - data->robotPoseToField.y);
-                if (dist > RANGE_THRESHOLD) {
-                    log_(format("tm ball dist to me(%.1f) > threshold(%.1f), TM %d can be trusted", dist, RANGE_THRESHOLD, i+ 1));
-                    minRange = status.ballRange;
-                    trustedTMIdx = aliveTmIdxs[i];
-                }  else {
-                    log_(format("tm ball dist to me(%.1f) < threshold(%.1f), TM %d can NOT be trusted", dist, RANGE_THRESHOLD, i+ 1));
-                }
-            }
-        }
-        if (trustedTMIdx >= 0) {
-            log_(format("Reliable tm ball found. PlayerID = %d", trustedTMIdx + 1));
-            data->tmBall.posToField = data->tmStatus[trustedTMIdx].ballPosToField;
-            updateRelativePos(data->tmBall);
-
-            tree->setEntry<bool>("tm_ball_pos_reliable", true);
-            lastTmBallPosTime = get_clock()->now();
-            if (!tree->getEntry<bool>("ball_location_known")) {
-                log_("update ball.posToField");
-                data->ball.posToField = data->tmBall.posToField;
-                updateRelativePos(data->ball);
-            }
-        } else {
-            log_("TM reported NO BALL or can not be trusted");
-            if (msecsSince(lastTmBallPosTime) > TM_BALL_TIMEOUT) {
-                log_("TM ball timeout reached");
-                tree->setEntry<bool>("tm_ball_pos_reliable", false);
-            }
         }
     }
 
-    bool switchRole;
-    get_parameter("strategy.cooperation.enable_role_switch", switchRole);
-    bool roleAssignEnable = false;
-    get_parameter("strategy.role_assignment.enable", roleAssignEnable);
-    if (roleAssignEnable) {
-        // 身份判定 (方案任务2): 决定性规则 R0-R5, 见 updateRoleAssignment.
-        updateRoleAssignment(aliveTmIdxs, gcAliveCount);
-    } else if (switchRole) {
-        // 旧行为 (回退用): 缺员即全员 striker; 自己被罚且恰缺一人则自封 goal_keeper.
-        if (data->penalty[selfIdx] == PENALTY_NONE) {
-            if (gcAliveCount < numOfPlayers) {
-                log_("Not full team. I must be Striker");
-                tree->setEntry<string>("player_role", "striker");
-            }
-        } else {
-            if (gcAliveCount == numOfPlayers - 1) {
-                log_("I am only on under penalty, I must be goal keeper");
-                tree->setEntry<string>("player_role", "goal_keeper");
-            }
-
+    updateCostToKick();
+    std::array<team_strategy::Candidate, team_strategy::kCapacity> candidates{};
+    data->myStrikerIDRank = 0;
+    const auto &fd = config->fieldDimensions;
+    for (int i = 0; i < count; ++i) {
+        if (i < self && eligible[i] && i + 1 != goalie) ++data->myStrikerIDRank;
+        const bool local = i == self;
+        const auto &status = data->tmStatus[i];
+        const bool inSkill = local ? data->tmImInVisualKick : status.isInVisualKick;
+        const auto &ballField = local ? data->ball.posToField : status.ballPosToField;
+        const double ballRange = local ? data->ball.range : status.ballRange;
+        const bool fresh = local ? hasFreshLocalBall() : status.ballDetected &&
+            msecsSince(status.ballObservationTime) >= 0.0 && msecsSince(status.ballObservationTime) <= 650.0;
+        const bool goalieClaims = i + 1 == goalie && (inSkill ||
+            (fresh && ballRange < 1.5 && ballField.x < -fd.length / 2.0 + fd.penaltyAreaLength));
+        candidates[i] = {i + 1, online[i] && (i + 1 != goalie || goalieClaims), inSkill,
+            local ? data->tmImLead : status.isLead, local ? data->tmMyCost : status.cost};
+    }
+    data->ballOwnerId = isMotionAllowed() ? team_strategy::owner(candidates, count,
+        get_parameter("strategy.cooperation.owner_switch_margin").as_double()) : 0;
+    if (data->gcReceived) {
+        bool completeView = config->enableCom;
+        for (int i = 0; i < count; ++i) {
+            const double age = msecsSince(data->tmStatus[i].timeLastCom);
+            if (i != self && eligible[i] && (age < 0.0 || age > 2200.0)) completeView = false;
+        }
+        if (!completeView && isMotionAllowed()) {
+            // Shared GC IDs, not independent local costs, resolve a network partition.
+            data->ballOwnerId = team_strategy::fallbackOwner(eligible, count, goalie);
         }
     }
-
-    if (tree->getEntry<string>("gc_game_state") == "INITIAL") {
-        tree->setEntry<string>("player_role", config->playerRole);
+    data->tmImLead = data->tmImAlive && data->ballOwnerId == config->playerId;
+    data->tmMyCostRank = 0;
+    for (int i = 0; i < count; ++i) {
+        if (i != self && candidates[i].available && team_strategy::better(candidates[i], candidates[self]))
+            ++data->tmMyCostRank;
     }
-
-
-    double tmMinCost = 1e5;
-    int myCostRank = 0;
-    int myStrikerIDRank = 0;
-    for (int i = 0; i < aliveTmIdxs.size(); i++) {
-        int tmIdx = aliveTmIdxs[i];
-        auto tmStatus = data->tmStatus[tmIdx];
-        if (tmStatus.cost < tmMinCost) tmMinCost = tmStatus.cost;
-        if (tmStatus.cost < data->tmMyCost) myCostRank++;
-        if (tmIdx < selfIdx && tmStatus.role == "striker") myStrikerIDRank++;
-    }
-    data->tmMyCostRank = myCostRank;
-    data->myStrikerIDRank = myStrikerIDRank;
-
-    double BALL_CONTROL_COST_THRESHOLD = 3.0;
-    get_parameter("strategy.cooperation.ball_control_cost_threshold", BALL_CONTROL_COST_THRESHOLD);
-
-    bool desiredLead = !(
-        (tmMinCost < BALL_CONTROL_COST_THRESHOLD && data->tmMyCost > tmMinCost)
-        || myCostRank >= 2
-    );
-
-    // lead 滞回: 两机 cost 接近时, lead 每 tick 抖动会导致双方反复抢/让球.
-    // 想翻转 lead 状态时, 距上次翻转须超过 lead_hold_msecs 才允许, 否则维持原状态.
-    double leadHoldMsecs = 0.0;
-    get_parameter("strategy.role_assignment.lead_hold_msecs", leadHoldMsecs);
-    bool newLead = desiredLead;
-    if (leadHoldMsecs > 0.0 && desiredLead != data->tmImLead) {
-        if (msecsSince(data->tmLastLeadFlipTime) < leadHoldMsecs) {
-            newLead = data->tmImLead; // 保持期内, 不翻转
-        } else {
-            data->tmLastLeadFlipTime = get_clock()->now(); // 允许翻转, 记录时刻
-        }
-    }
-
-    if (!newLead) {
-        data->tmImLead = false;
-        tree->setEntry<bool>("is_lead", false);
-        log_("I am not lead");
-    } else {
-        data->tmImLead = true;
-        tree->setEntry<bool>("is_lead", true);
-        log_("I am Lead");
-    }
-    log_(format("tmMinCost: %.1f, myCost: %.1f, myCostRank: %d, myStrikerIDRank: %d", tmMinCost, data->tmMyCost, myCostRank, myStrikerIDRank));
-
-
-    // 原 GK 只有在周期状态中观察到接任者已声明 goal_keeper 后才退出。
-    // 请求丢失、目标离线或超时均保持原角色，避免出现无人守门。
-    if (data->pendingGoalieId >= 1) {
-        double confirmTimeoutMsecs = 2000.0;
-        get_parameter("strategy.role_assignment.handover_confirm_timeout_msecs", confirmTimeoutMsecs);
-        const int pendingIdx = data->pendingGoalieId - 1;
-        const bool targetConfirmed = data->tmStatus[pendingIdx].isAlive
-            && data->tmStatus[pendingIdx].role == "goal_keeper"
-            && msecsSince(data->tmStatus[pendingIdx].timeLastCom) <= COM_TIMEOUT;
-        const bool targetUnavailable = data->penalty[pendingIdx] != PENALTY_NONE
-            || msecsSince(data->tmStatus[pendingIdx].timeLastCom) > COM_TIMEOUT;
-        const bool requestTimedOut = msecsSince(data->pendingGoalieRequestTime) > confirmTimeoutMsecs;
-
-        if (targetConfirmed) {
-            data->actingGoalieId = data->pendingGoalieId;
-            tree->setEntry<string>("player_role", "striker");
-            log_(format("goalie handover confirmed by player %d", data->pendingGoalieId));
-            data->pendingGoalieId = -1;
-        } else if (targetUnavailable || requestTimedOut) {
-            log_(format("goalie handover to player %d cancelled (%s)", data->pendingGoalieId,
-                targetUnavailable ? "target unavailable" : "confirmation timeout"));
-            data->pendingGoalieId = -1;
-            data->tmMyCmd = 0;
-        }
-    }
-
-    if (
-        data->tmImAlive 
-        && tree->getEntry<string>("player_role") == "goal_keeper"
-        && data->tmImLead 
-        && data->pendingGoalieId < 0
-        && msecsSince(data->tmLastCmdChangeTime) > CMD_COOLDOWN 
-    ) {
-        auto distToGoal = [=](Pose2D pose) {
-            return norm(pose.x + config->fieldDimensions.length / 2.0, pose.y);
-        };
-        double maxDist = 0.0;
-        double minDist = 1e6;
-        int minIndex = -1; 
-        double myDist = distToGoal(data->robotPoseToField);
-        for (int i = 0; i < aliveTmIdxs.size(); i++) {
-            int tmIdx = aliveTmIdxs[i];
-            auto tmPose = data->tmStatus[tmIdx].robotPoseToField;
-            double dist = distToGoal(tmPose);
-            if (dist > maxDist) maxDist = dist;
-            if (dist < minDist) {
-                minIndex = tmIdx;
-                minDist = dist;
-            }
-        }
-        if (minIndex >= 0 && myDist > maxDist) {
-            data->tmLastCmdChangeTime = get_clock()->now();
-            data->tmMyCmd = 10 + minIndex + 1;
-            data->tmCmdId += 1;
-            data->tmMyCmdId = data->tmCmdId;
-            data->pendingGoalieId = minIndex + 1;
-            data->pendingGoalieRequestTime = get_clock()->now();
-            log_(format("goalie: request player %d to take goal; keep guarding until confirmed", minIndex + 1));
-        } else {
-            log_(format("goalie: i am close enough to goal, no need to attack, my dist: %.2f", myDist));
-        }
-    }
-
-
-    auto cmd = data->tmReceivedCmd;
-    if (cmd != 0) {
-        log_(format("received cmd %d from teammate", cmd));
-        // 注: cmd==100(队友宣告控球)的接收逻辑存在, 但当前无任何发送方 —— lead/assist 实际只由 cost 排名驱动。
-        //     唯一被实际发送的协同指令是守门->前锋交接 (10+id)。此分支为已定义但未触发的协议路径。
-        if (cmd == 100) { // 队友要控球
-            data->tmImLead = false;
-            tree->setEntry<bool>("is_lead", false);
-            log_("teammate wants to take lead, i'll assist");
-        } else if (cmd > 10 && cmd < 20) {
-            log_("goalie wants to attack");
-            int newGoalieId = cmd - 10;
-            if (newGoalieId == selfId) {
-                log_("i become goalie");
-                tree->setEntry<string>("player_role", "goal_keeper");
-                data->actingGoalieId = selfId; // 我成为临时守门员
-                speak("i become goalie", true);
-            } else {
-                log_(format("teammate %d becomes goalie", newGoalieId));
-                data->actingGoalieId = newGoalieId; // 记录临时守门员是谁, 供角色判定避免二次抢守门
-            }
-        } else {
-            log_(format("unknown cmd %d from teammate", cmd));
-        }
-
-        data->tmReceivedCmd = 0; 
-    }
-
     tree->setEntry<bool>("is_lead", data->tmImLead);
-
-    if (
-        (tree->getEntry<string>("gc_game_state") == "READY" || tree->getEntry<string>("gc_game_sub_state") == "GET_READY")
-        && gcAliveCount == numOfPlayers
-    ) {
-
-        tree->setEntry<string>("player_role", config->playerRole);
-        data->actingGoalieId = -1; // 满员回到初始角色, 清除临时守门交接状态
-        data->pendingGoalieId = -1;
-        log_(format("all teammates on field. Back to initial role: %s", config->playerRole.c_str()));
-    }
-
-    return;
 }
 
 int Brain::getEffectiveGoalkeeperId() const
 {
-    const int actingGoalieId = data->actingGoalieId;
-    const bool actingGoalieIsAvailable = actingGoalieId >= 1
-        && actingGoalieId <= HL_MAX_NUM_PLAYERS
-        && data->penalty[actingGoalieId - 1] == PENALTY_NONE;
-    if (actingGoalieIsAvailable) {
-        return actingGoalieId;
+    if (!data->gcReceived) return config->goalkeeperId;
+    const int count = std::min(config->numOfPlayers, data->gcPlayersPerTeam);
+    std::array<bool, team_strategy::kCapacity> eligible{};
+    int alive = 0;
+    for (int i = 0; i < count; ++i) {
+        eligible[i] = data->penalty[i] == PENALTY_NONE;
+        if (eligible[i]) ++alive;
     }
-
-    const bool gameControllerGoalieIsAvailable = data->gcGoalkeeperIdx >= 0
-        && data->gcGoalkeeperIdx < HL_MAX_NUM_PLAYERS
-        && data->gcGoalkeeperAlive
-        && data->penalty[data->gcGoalkeeperIdx] == PENALTY_NONE;
-    if (gameControllerGoalieIsAvailable) {
-        return data->gcGoalkeeperIdx + 1;
-    }
-
-    return -1;
+    if (alive == 1 && !isDefensing() && !tree->getEntry<bool>("wait_for_opponent_kickoff")) return 0;
+    const int preferred = data->gcGoalkeeperIdx >= 0 ? data->gcGoalkeeperIdx + 1 : config->goalkeeperId;
+    return team_strategy::goalkeeper(eligible, count, preferred,
+        get_parameter("strategy.role_assignment.gk_takeover").as_bool());
 }
 
-// 身份判定 (方案任务2): 决定性角色分配 R0-R5. 见 docs/2026-07-10_方案落地_实施计划.md §4.3.
-// 存活集合一律以 GC penalty 数组为准 (全队同源, 与各机通信状况无关), 各机独立计算结果一致;
-// 通信只用于读取队友当前宣称的角色 (tmStatus[].role, 字符串在通信超时后仍保留, 有粘性).
-void Brain::updateRoleAssignment(const vector<int> &aliveTmIdxs, int gcAliveCount)
-{
-    (void)aliveTmIdxs; // 存活判定改用 GC penalty, 保留参数以维持调用点稳定
-    auto log_ = [=](string msg) {
-        log->setTimeNow();
-        log->log("debug/updateRoleAssignment", rerun::TextLog(msg));
-    };
-
-    const int selfId = config->playerId;
-    const int selfIdx = selfId - 1;
-    const string gameState = tree->getEntry<string>("gc_game_state");
-    const string curRole = tree->getEntry<string>("player_role");
-
-    // R0: INITIAL -> 回配置角色. (READY/GET_READY 满员回位由 handleCooperation 末尾既有逻辑处理)
-    if (gameState == "INITIAL") {
-        tree->setEntry<string>("player_role", config->playerRole);
-        data->actingGoalieId = -1;
-        data->pendingGoalieId = -1;
-        return;
-    }
-
-    // 被罚下的自己不参与角色计算 (不在场上, 回场后按规则重新归位).
-    if (data->penalty[selfIdx] != PENALTY_NONE) {
-        return;
-    }
-
-    bool gkTakeover = true;
-    get_parameter("strategy.role_assignment.gk_takeover", gkTakeover);
-
-    // 全队存活球员 id 升序列表 (纯 GC 数据, 含本机).
-    vector<int> aliveIds;
-    for (int i = 0; i < HL_MAX_NUM_PLAYERS; i++) {
-        if (data->penalty[i] == PENALTY_NONE) aliveIds.push_back(i + 1);
-    }
-
-    // 临时交接守门员若已被罚下, 解除交接锁存.
-    if (data->actingGoalieId >= 1 && data->penalty[data->actingGoalieId - 1] != PENALTY_NONE) {
-        log_(format("acting goalie %d penalized, release", data->actingGoalieId));
-        data->actingGoalieId = -1;
-    }
-
-    // R3: 场上仅剩我一人 (以 GC 为准).
-    if (gcAliveCount <= 1) {
-        // 防守性场景 (仅限对方开球等待期 / 对方任意球) -> 守门; 否则 (含我方开球与普通比赛, 已确认) -> 前锋.
-        bool defensiveScene = tree->getEntry<bool>("wait_for_opponent_kickoff") || isDefensing();
-        string role = defensiveScene ? "goal_keeper" : "striker";
-        if (curRole != role) {
-            tree->setEntry<string>("player_role", role);
-            log_(format("R3: only me alive, scene=%s -> %s", defensiveScene ? "defense" : "attack", role.c_str()));
-        }
-        return;
-    }
-
-    // 确定"应当守门者" desiredGkId. 权威身份统一由 getEffectiveGoalkeeperId() 提供，
-    // 其后才使用现有宣称者或最小存活 ID 进行冲突消解与缺位接任。
-    int desiredGkId = -1;
-    string reason;
-    const int effectiveGoalkeeperId = getEffectiveGoalkeeperId();
-    if (effectiveGoalkeeperId >= 1) {
-        desiredGkId = effectiveGoalkeeperId;
-        reason = effectiveGoalkeeperId == data->actingGoalieId ? "acting(handover)" : "gc_flag";
-    } else {
-        // 宣称者: 自己看黑板角色, 队友看通信角色 (有粘性, 防通信丢包时守门员被顶替).
-        vector<int> claimants;
-        for (int id : aliveIds) {
-            if (id == selfId) {
-                if (curRole == "goal_keeper") claimants.push_back(id);
-            } else if (data->tmStatus[id - 1].role == "goal_keeper") {
-                claimants.push_back(id);
-            }
-        }
-        if (!claimants.empty()) {
-            desiredGkId = claimants.front(); // aliveIds 升序遍历, front 即最小 id
-            reason = format("claimants(cnt=%d)", (int)claimants.size());
-            if (claimants.size() >= 2) log_("R5: multiple GK claimants, min id wins");
-        } else if (gkTakeover && !aliveIds.empty()) {
-            desiredGkId = aliveIds.front(); // R2: 无任何守门员 -> 最小存活 id 接任
-            reason = "election(min alive id)";
-        }
-    }
-
-    // 只改自己的角色, 不指挥队友 (各机独立收敛到同一结果).
-    if (desiredGkId == selfId && curRole != "goal_keeper") {
-        tree->setEntry<string>("player_role", "goal_keeper");
-        speak("i take goalie", true);
-        log_(format("-> goal_keeper (%s)", reason.c_str()));
-    } else if (desiredGkId != selfId && curRole == "goal_keeper") {
-        tree->setEntry<string>("player_role", "striker");
-        speak("i attack", true);
-        log_(format("-> striker, GK is player %d (%s)", desiredGkId, reason.c_str()));
-    }
-}
 
 void Brain::updateMemory()
 {
@@ -1586,11 +1284,13 @@ void Brain::updateBallMemory()
     double ballMemTimeout;
     get_parameter("strategy.ball_memory_timeout", ballMemTimeout);
 
-    if (secs > ballMemTimeout) 
+    if (data->ball.timePoint.nanoseconds() <= 0 || secs < 0.0 || secs > ballMemTimeout)
     { 
         tree->setEntry<bool>("ball_location_known", false);
         tree->setEntry<bool>("ball_out", false); 
     }
+    if (!hasFreshLocalBall()) data->ballDetected = false;
+    data->lose_ball = !hasFreshLocalBall(1000.0);
 
     
     updateRelativePos(data->ball);
@@ -1636,40 +1336,40 @@ void Brain::updateRobotMemory() {
     logMemRobots();
 }
 
-void Brain::updateKickoffMemory() {
-    
-    static Point ballPos;
-    const double BALL_MOVE_THRESHOLD_FACTOR = 0.15; 
-    const double BALL_MOVE_THRESHOLD_MIN = 0.3; 
-    auto ballMoved = [=]() {
-        if (!data->ballDetected) return false; 
-        double range = data->ball.range;
-        double threshold = max(range * BALL_MOVE_THRESHOLD_FACTOR, BALL_MOVE_THRESHOLD_MIN);
-        double posChange = norm(data->ball.posToRobot.x - ballPos.x, data->ball.posToRobot.y - ballPos.y);
-        return posChange > threshold;
-    };
-    static rclcpp::Time kickOffTime;
-    const double TIMEOUT = 1000 * 10; 
-    auto timeReached = [=]() {
-        return msecsSince(kickOffTime) > TIMEOUT;
-    };
-    bool isWaitingForKickoff = (
-        (tree->getEntry<string>("gc_game_state") == "SET"  || tree->getEntry<string>("gc_game_state") == "READY")
-        && !tree->getEntry<bool>("gc_is_kickoff_side")
-    );
-    bool isWaitingForFreekickKickoff = (
-        (tree->getEntry<string>("gc_game_sub_state") == "SET" || tree->getEntry<string>("gc_game_sub_state") == "GET_READY")
-        && !tree->getEntry<bool>("gc_is_sub_state_kickoff_side")
-    );
-    if ( isWaitingForFreekickKickoff || isWaitingForKickoff) {
-        ballPos = data->ball.posToRobot;
-        kickOffTime = get_clock()->now();
+void Brain::updateKickoffMemory()
+{
+    if (!data->gcReceived) return;
+    const bool primaryPrep = (matchState_.primary == match_policy::Primary::Ready ||
+        matchState_.primary == match_policy::Primary::Set) && !matchState_.ownKickoff;
+    const bool opponentRestart = matchState_.restart != match_policy::Restart::None && !matchState_.ownRestart;
+    const bool legacyPrep = !matchState_.modern && opponentRestart;
+    if (primaryPrep || legacyPrep || (opponentRestart && !opponentRestartLatched_)) {
+        opponentKickoffBall_ = data->ball.posToField;
+        opponentKickoffTime_ = get_clock()->now();
+        waitingForPrimaryKickoff_ = primaryPrep;
         tree->setEntry<bool>("wait_for_opponent_kickoff", true);
-    } else if (tree->getEntry<bool>("wait_for_opponent_kickoff")) {
-        if (ballMoved() || timeReached()) {
-            tree->setEntry<bool>("wait_for_opponent_kickoff", false);
-        }
     }
+    bool wait = tree->getEntry<bool>("wait_for_opponent_kickoff");
+    if (matchState_.modern) {
+        if (opponentRestartLatched_ && !opponentRestart) wait = false;
+        if (opponentRestart) wait = true;
+        if (!matchState_.ownKickoff && matchState_.primary == match_policy::Primary::Play &&
+            matchState_.restart == match_policy::Restart::None && matchState_.secondarySeconds > 0) wait = true;
+        if (waitingForPrimaryKickoff_ && matchState_.primary == match_policy::Primary::Play &&
+            matchState_.restart == match_policy::Restart::None && matchState_.secondarySeconds <= 0) {
+            wait = false;
+            waitingForPrimaryKickoff_ = false;
+        }
+    } else if (wait && !primaryPrep && !legacyPrep) {
+        const double threshold = std::max(data->ball.range * 0.15, 0.3);
+        const bool moved = hasFreshLocalBall() && norm(data->ball.posToField.x - opponentKickoffBall_.x,
+            data->ball.posToField.y - opponentKickoffBall_.y) > threshold;
+        if (moved || msecsSince(opponentKickoffTime_) >= 10000.0) wait = false;
+    }
+    if (matchState_.ownKickoff && !opponentRestart) wait = false;
+    if (matchState_.phase == match_policy::Phase::PenaltyShootout) wait = !matchState_.ownKickoff;
+    tree->setEntry<bool>("wait_for_opponent_kickoff", wait);
+    opponentRestartLatched_ = opponentRestart;
 }
 
 vector<double> Brain::getGoalPostAngles(const double margin)
@@ -1720,83 +1420,24 @@ double Brain::calcKickDir(double goalPostMargin) {
     return theta_r;
 }
 
-void Brain::updateCostToKick() {
-    auto log_ = [=](string msg) {
-        log->setTimeNow();
-        log->log("debug/updateCostToKick", rerun::TextLog(msg));
-    };
-    double cost = 0.;
-
-
-    // if (!data->ballDetected) cost += 2.0;
-    double secsSinceBallDet = msecsSince(data->ball.timePoint) / 1000;
-    cost += secsSinceBallDet;
-    log_(format("ball not dectect cost: %.1f", secsSinceBallDet));
-
-
-    if (!tree->getEntry<bool>("ball_location_known")) {
-        cost += 5.0;
-        log_(format("ball lost cost: %.1f", 5.0));
+void Brain::updateCostToKick()
+{
+    const auto ball = getBallForChase();
+    const bool known = tree->getEntry<bool>("ball_location_known") || tree->getEntry<bool>("tm_ball_pos_reliable");
+    if (!known || !std::isfinite(ball.range) || !std::isfinite(ball.yawToRobot) ||
+        !std::isfinite(data->kickDir)) {
+        // Searching players still get a finite, deterministic owner rather than NaN.
+        data->tmMyCost = 100.0;
+        return;
     }
-
-
-    cost += data->ball.range;
-    log_(format("ball range cost: %.1f", data->ball.range));
-    
-    
-
-    if (distToObstacle(data->ball.yawToRobot) < 1.5) {
-        log_(format("obstacle cost: %.1f", 2.0));
-        cost += 0.5;
-    }
-
-
-    cost += fabs(data->ball.yawToRobot) / 1.0; 
-    log_(format("ball yaw cost: %.1f", fabs(data->ball.yawToRobot) / 1.0));
-
-
-
-    int selfIdx = config->playerId - 1;
-    for (int i = 0; i < HL_MAX_NUM_PLAYERS; i++) {
-        if (i == selfIdx) continue; 
-
-        auto status = data->tmStatus[i]; 
-        if (!status.isAlive) continue; 
-
-        double theta_tm2ball = atan2(status.ballPosToField.y - status.robotPoseToField.y, status.ballPosToField.x - status.robotPoseToField.x);
-        double range_tm2ball = norm(status.ballPosToField.y - status.robotPoseToField.y, status.ballPosToField.x - status.robotPoseToField.x);
-        double theta_me2ball = data->robotBallAngleToField;
-        double range_me2ball = data->ball.range;
-        double deltaTheta = fabs(toPInPI(theta_tm2ball - theta_me2ball));
-
-        const double BUMP_DIST = 1.0;
-        if (range_tm2ball < range_me2ball && sin(deltaTheta) * range_tm2ball < BUMP_DIST) {
-            cost += 2.0;
-            log_(format("bump cost: %.1f", 2.0));  
-        }
-    }
-
-    cost += fabs(toPInPI(data->kickDir - data->robotBallAngleToField)) * 0.4 / 0.3; 
-    log_(format("ajust cost: %.1f", fabs(toPInPI(data->kickDir - data->robotBallAngleToField)) * 0.4 / 0.3));
-    
-
-    if (data->recoveryState == RobotRecoveryState::HAS_FALLEN) {
-        cost += 15.0;
-        log_(format("fall cost: %.1f", 15.0));  
-    }
-
-    
-    if (!tree->getEntry<bool>("odom_calibrated")) {
-        cost += 100;
-        log_(format("localization cost: %.1f", 100.0));  
-
-    }
-    
-    double lastCost = data->tmMyCost;
-    data->tmMyCost = lastCost * 0.8 + cost * 0.2;
-    log_(format("lastCost: %.1f, newCost: %.1f, smoothCost: %.1f", lastCost, cost, data->tmMyCost));
-
-    return;
+    const double ageSeconds = std::clamp(msecsSince(ball.timePoint) / 1000.0, 0.0, 3.0);
+    double cost = ball.range + ageSeconds + fabs(ball.yawToRobot) +
+        fabs(toPInPI(data->kickDir - atan2(ball.posToField.y - data->robotPoseToField.y,
+            ball.posToField.x - data->robotPoseToField.x))) * 0.4 / 0.3;
+    if (distToObstacle(ball.yawToRobot) < 1.5) cost += 0.5;
+    if (data->recoveryState != RobotRecoveryState::IS_READY) cost += 15.0;
+    if (!tree->getEntry<bool>("odom_calibrated")) cost += 100.0;
+    data->tmMyCost = std::isfinite(cost) ? std::max(0.0, cost) : 100.0;
 }
 
 bool Brain::isAngleGood(double goalPostMargin, string type) {
@@ -1819,27 +1460,7 @@ bool Brain::isAngleGood(double goalPostMargin, string type) {
 }
 
 bool Brain::isPrimaryStriker() {
-    string myRole = tree->getEntry<string>("player_role");
-    if (myRole != "striker") return false; 
-
-    if (!config->enableCom) return true; 
-
-    // find first alive striker that is not me.
-    auto firstAliveStrikerIdx = -1;
-    auto myIdx = config->playerId - 1;
-
-    for (int i = 0; i < HL_MAX_NUM_PLAYERS; i++) {
-        auto status = data->tmStatus[i];
-        if (data->penalty[i] == PENALTY_NONE && status.isAlive && status.role == "striker") {
-            firstAliveStrikerIdx = i;
-            break;
-        }
-    }
-
-    if ( firstAliveStrikerIdx >= 0 && firstAliveStrikerIdx <  myIdx) return false; // 有 id 更小的活的前锋, 让他来当主力
-
-    // else 没有 id 更小的活的前锋, 我是主力
-    return true;
+    return tree->getEntry<string>("player_role") == "striker" && data->tmImLead;
 }
 
 bool Brain::isBallOut(double locCompareDist, double lineCompareDist)
@@ -1921,14 +1542,11 @@ void Brain::updateBallPrediction() {
 }
 
 GameObject Brain::getBallForChase() const {
-    bool isSetPlay = tree->getEntry<string>("gc_game_sub_state_type") != "NONE";
-    bool ballOut = tree->getEntry<bool>("ball_out");
-    if (config->ballPredictionEnable
-        && config->ballPredictionUseForChase
-        && !(config->ballPredictionDisableForSetPlayChase && (isSetPlay || ballOut))
-        && data->ballPredictionValid) {
-        return data->predictedBall;
-    }
+    const bool setPlay = data->gcSetPlay != 0 || tree->getEntry<string>("gc_game_sub_state_type") != "NONE";
+    if (config->ballPredictionEnable && config->ballPredictionUseForChase &&
+        !(config->ballPredictionDisableForSetPlayChase && (setPlay || tree->getEntry<bool>("ball_out"))) &&
+        data->ballPredictionValid) return data->predictedBall;
+    if (!tree->getEntry<bool>("ball_location_known") && tree->getEntry<bool>("tm_ball_pos_reliable")) return data->tmBall;
     return data->ball;
 }
 
@@ -1959,7 +1577,7 @@ bool Brain::isBoundingBoxInCenter(BoundingBox boundingBox, double xRatio, double
         && (y < config->camPixY * (1 + yRatio) / 2);
 }
 
-bool Brain::isDefensing() {
+bool Brain::isDefensing() const {
     bool isFreeKick = tree->getEntry<string>("gc_game_sub_state_type") == "FREE_KICK";
     bool isKickoffSide = tree->getEntry<bool>("gc_is_sub_state_kickoff_side");
     
@@ -1968,6 +1586,13 @@ bool Brain::isDefensing() {
 
 void Brain::calibrateOdom(double x, double y, double theta)
 {
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(theta)) return;
+    if (ballPredictor) ballPredictor->reset();
+    data->ballPredictionValid = false;
+    data->predictedBallPos.clear();
+    teammateBall->reset();
+    data->tmBallShareReliable = false;
+    tree->setEntry<bool>("tm_ball_pos_reliable", false);
 
     double x_or, y_or, theta_or; // or = odom to robot
     x_or = -cos(data->robotPoseToOdom.theta) * data->robotPoseToOdom.x - sin(data->robotPoseToOdom.theta) * data->robotPoseToOdom.y;
@@ -2006,12 +1631,14 @@ void Brain::calibrateOdom(double x, double y, double theta)
     for (int i = 0; i < goalposts.size(); i++) {
         updateFieldPos(goalposts[i]);
     }
+    data->setGoalposts(goalposts);
     
     // markers
     auto markings = data->getMarkings();
     for (int i = 0; i < markings.size(); i++) {
         updateFieldPos(markings[i]);
     }
+    data->setMarkings(markings);
 
     // relog
     log->setTimeNow();
@@ -2095,17 +1722,10 @@ double Brain::msecsSince(rclcpp::Time time)
 }
 
 rclcpp::Time Brain::timePointFromHeader(std_msgs::msg::Header header) {
-    auto stamp = header.stamp;
-    // NOTE 似乎无论 use_sim_time 是否为真, 都使用的是 ROS_TIME 
-    auto sec = stamp.sec;
-    auto nanosec = stamp.nanosec;
-    if (sec <= 0 || nanosec <= 0) {
-        sec = 1;
-        nanosec = 1;
-        prtErr(format("Negative time: sec: %d nanosec: %d"));
-    }
-    return rclcpp::Time(sec, nanosec, RCL_ROS_TIME); // should not crash
-    // return rclcpp::Time(stamp.sec, stamp.nanosec, RCL_ROS_TIME);  // should crash sometimes
+    const auto stamp = header.stamp;
+    const auto clockType = get_clock()->get_clock_type();
+    if (stamp.sec < 0 || stamp.nanosec >= 1000000000U) return rclcpp::Time(0, 0, clockType);
+    return rclcpp::Time(stamp.sec, stamp.nanosec, clockType);
 }
 
 
@@ -2159,7 +1779,11 @@ void Brain::joystickCallback(const booster_interface::msg::RemoteControllerState
         if (joy.x)
         {
             tree->setEntry<int>("control_state", 1);
-            client->setVelocity(0., 0., 0.);
+            tree->setEntry<bool>("assist_chase", false);
+            tree->setEntry<bool>("assist_kick", false);
+            tree->setEntry<bool>("go_manual", false);
+            tree->halt();
+            client->stopMotion();
             client->moveHead(0., 0.);
             prtDebug("State => 1: CANCEL");
             // playSound("sad");
@@ -2177,13 +1801,9 @@ void Brain::joystickCallback(const booster_interface::msg::RemoteControllerState
             prtDebug("State => 3: ACTION");
             // playSound("exited");
         }
-        else if (joy.y)
-        {
-            string curRole = tree->getEntry<string>("player_role");
-            curRole == "striker" ? tree->setEntry<string>("player_role", "goal_keeper") : tree->setEntry<string>("player_role", "striker");
-            prtDebug("SWITCH ROLE");
-            log_("SWITCH ROLE");
-            // playSound("talk");
+        else if (joy.y && !data->gcReceived) {
+            const auto role = tree->getEntry<string>("player_role");
+            tree->setEntry<string>("player_role", role == "striker" ? "goal_keeper" : "striker");
         }
     }
 
@@ -2224,173 +1844,116 @@ void Brain::joystickCallback(const booster_interface::msg::RemoteControllerState
 
 void Brain::gameControlCallback(const game_controller_interface::msg::GameControlData &msg)
 {
+    const int teamIndex = msg.teams[0].team_number == config->teamId ? 0 :
+        (msg.teams[1].team_number == config->teamId ? 1 : -1);
+    if (teamIndex < 0 || msg.teams[0].team_number == msg.teams[1].team_number ||
+        msg.players_per_team < 1 || msg.players_per_team > 20) return;
+    const auto &ours = msg.teams[teamIndex];
+    const auto &opponent = msg.teams[1 - teamIndex];
+    const int count = std::min<int>(config->numOfPlayers, msg.players_per_team);
+    if (ours.players.size() < static_cast<size_t>(count) || opponent.players.size() < static_cast<size_t>(count)) return;
+    match_policy::Input input;
+    input.version = msg.version;
+    input.primary = msg.state;
+    input.phase = msg.game_phase;
+    input.setPlay = msg.set_play;
+    input.stopped = msg.stopped;
+    input.legacySecondary = msg.secondary_state;
+    input.legacyStage = static_cast<unsigned char>(msg.secondary_state_info[1]);
+    input.ownKickoff = msg.kick_off_team == config->teamId;
+    input.ownSetPlay = static_cast<unsigned char>(msg.secondary_state_info[0]) == config->teamId;
+    input.secondarySeconds = msg.secondary_time;
+    const int self = config->playerId - 1;
+    input.penalized = self >= count || !ours.players[self].available ||
+        ours.players[self].penalty != PENALTY_NONE || ours.players[self].red_card_count > 0;
+    const auto next = match_policy::interpret(input);
+    if (!next.valid) return;
+    if (data->gcReceived && msg.version == data->gcProtocolVersion &&
+        msecsSince(data->timeLastGamecontrolMsg) <= config->gameControllerTimeoutMs &&
+        !match_policy::newerPacket(msg.packet_number, lastGameControllerPacket_)) return;
+    lastGameControllerPacket_ = msg.packet_number;
+    const auto previous = matchState_;
+    const bool previouslyPenalized = matchState_.penalized;
+    matchState_ = next;
+    if (next.ownRestart && next.restart != match_policy::Restart::None &&
+        next.restart != match_policy::Restart::Penalty && next.restart != match_policy::Restart::Direct &&
+        (previous.restart != next.restart || !previous.ownRestart)) {
+        data->kickoffGuardActive = get_parameter("strategy.kickoff_guard.enable").as_bool();
+        data->kickoffGuardBallLocked = false;
+        data->kickoffGuardMoveConfirmCount = 0;
+    }
+    data->gcReceived = true;
+    data->gcStopped = next.stopped;
+    data->gcGamePhase = static_cast<int>(next.phase);
+    data->gcSetPlay = static_cast<int>(next.restart);
+    data->gcPlayersPerTeam = msg.players_per_team;
+    data->gcProtocolVersion = msg.version;
+    data->gcSecondaryTime = msg.secondary_time;
     data->timeLastGamecontrolMsg = get_clock()->now();
-
-    // 处理比赛的一级状态
-    auto lastGameState = tree->getEntry<string>("gc_game_state"); // 比赛的一级状态
-    vector<string> gameStateMap = {
-        "INITIAL", // 初始化状态, 球员在场外准备
-        "READY",   // 准备状态, 球员进场, 并走到自己的始发位置
-        "SET",     // 停止动作, 等待裁判机发出开始比赛的指令
-        "PLAY",    // 正常比赛
-        "END"      // 比赛结束
-    };
-    string gameState = gameStateMap[static_cast<int>(msg.state)];
-    tree->setEntry<string>("gc_game_state", gameState);
-    bool isKickOffSide = (msg.kick_off_team == config->teamId); // 我方是否是开球方
-    tree->setEntry<bool>("gc_is_kickoff_side", isKickOffSide);
-
-    // 球共享 (方案任务3): 进入 INITIAL/READY 时清空队友球共享的"上次可信结果", 防止跨局沿用陈旧球位.
-    // 被罚重进场的清理走 isUnderPenalty 触发 odom_calibrated=false 的路径, 见本函数末尾.
-    if (config->tmBallShareEnable && teammateBall && gameState != lastGameState
-        && (gameState == "INITIAL" || gameState == "READY")) {
+    communication->setGameControllerProtocolVersion(msg.version);
+    std::fill(std::begin(data->penalty), std::end(data->penalty), PENALTY_SUBSTITUTE);
+    std::fill(std::begin(data->oppoPenalty), std::end(data->oppoPenalty), PENALTY_SUBSTITUTE);
+    data->liveCount = data->oppoLiveCount = 0;
+    data->gcGoalkeeperIdx = -1;
+    for (int i = 0; i < count; ++i) {
+        const auto &player = ours.players[i];
+        const auto &other = opponent.players[i];
+        data->penalty[i] = !player.available || player.red_card_count > 0 ? PENALTY_SUBSTITUTE : player.penalty;
+        data->oppoPenalty[i] = !other.available || other.red_card_count > 0 ? PENALTY_SUBSTITUTE : other.penalty;
+        if (data->penalty[i] == PENALTY_NONE) ++data->liveCount;
+        if (data->oppoPenalty[i] == PENALTY_NONE) ++data->oppoLiveCount;
+        if (player.goal_keeper) data->gcGoalkeeperIdx = i;
+    }
+    if (ours.goalkeeper >= 1 && ours.goalkeeper <= count) data->gcGoalkeeperIdx = ours.goalkeeper - 1;
+    data->gcGoalkeeperAlive = data->gcGoalkeeperIdx >= 0 && data->penalty[data->gcGoalkeeperIdx] == PENALTY_NONE;
+    data->realGameSubState = match_policy::restartName(next);
+    data->isDirectShoot = next.restart == match_policy::Restart::Direct || next.restart == match_policy::Restart::Penalty;
+    tree->setEntry<string>("gc_game_state", match_policy::primaryName(next.primary));
+    tree->setEntry<bool>("gc_play_stopped", next.stopped);
+    tree->setEntry<int>("gc_protocol_version", msg.version);
+    tree->setEntry<int>("gc_game_phase", data->gcGamePhase);
+    tree->setEntry<int>("gc_set_play", data->gcSetPlay);
+    tree->setEntry<int>("gc_secondary_time", data->gcSecondaryTime);
+    tree->setEntry<bool>("gc_is_kickoff_side", next.ownKickoff);
+    tree->setEntry<bool>("gc_is_sub_state_kickoff_side", next.ownRestart);
+    string type = next.phase == match_policy::Phase::Timeout ? "TIMEOUT" : "NONE";
+    string stage = next.stopped ? "STOP" : "PLAY";
+    if (next.restart != match_policy::Restart::None && !(next.modern && next.ownRestart && !next.stopped)) {
+        type = "FREE_KICK";
+        stage = next.stopped ? "STOP" : "GET_READY";
+    }
+    tree->setEntry<string>("gc_game_sub_state_type", type);
+    tree->setEntry<string>("gc_game_sub_state", stage);
+    tree->setEntry<bool>("gc_is_under_penalty", next.penalized);
+    const bool penalty = next.primary == match_policy::Primary::Play &&
+        (next.restart == match_policy::Restart::Penalty || next.phase == match_policy::Phase::PenaltyShootout);
+    tree->setEntry<bool>("penalty_kick_active", penalty);
+    tree->setEntry<bool>("penalty_kick_defending", penalty && !next.ownRestart);
+    if (next.penalized && !previouslyPenalized) tree->setEntry<bool>("odom_calibrated", false);
+    if (next.penalized || previous.primary != next.primary || previous.phase != next.phase || previous.restart != next.restart) {
         teammateBall->reset();
+        data->tmBallShareReliable = false;
+        tree->setEntry<bool>("tm_ball_pos_reliable", false);
+        if (ballPredictor) ballPredictor->reset();
+        data->ballPredictionValid = false;
     }
-
-    // 处理比赛的二级状态
-    string gameSubStateType;
-    switch (static_cast<int>(msg.secondary_state)) {
-        case 0:
-            gameSubStateType = "NONE";
-            data->realGameSubState = "NONE";
-            break;
-        case 3:
-            gameSubStateType = "TIMEOUT"; // 包含两队 timeout 和 裁判 timeout
-            data->realGameSubState = "TIMEOUT";
-            break;
-        // 暂时不处理其它状态, 除 TIMEOUT 外, 都按 FREE_KICK 处理
-        case 4:
-            // gameSubStateType = "DIRECT_FREEKICK";
-            gameSubStateType = "FREE_KICK";
-            data->realGameSubState = "DIRECT_FREEKICK";
-            data->isDirectShoot = true;
-            break;
-        case 5:
-            // gameSubStateType = "INDIRECT_FREEKICK";
-            gameSubStateType = "FREE_KICK";
-            data->realGameSubState = "INDIRECT_FREEKICK";
-            break;
-        case 6:
-            // gameSubStateType = "PENALTY_KICK";
-            gameSubStateType = "FREE_KICK";
-            data->realGameSubState = "PENALTY_KICK";
-            data->isDirectShoot = true;
-            break;
-        case 7:
-            // gameSubStateType = "CORNER_KICK";
-            gameSubStateType = "FREE_KICK";
-            data->realGameSubState = "CORNER_KICK";
-            break;
-        case 8:
-            // gameSubStateType = "GOAL_KICK";
-            gameSubStateType = "FREE_KICK";
-            data->realGameSubState = "GOAL_KICK";
-            data->isDirectShoot = true;
-            break;
-        case 9:
-            // gameSubStateType = "THROW_IN";
-            gameSubStateType = "FREE_KICK";
-            data->realGameSubState = "THROW_IN";
-            break;
-        default:
-            gameSubStateType = "FREE_KICK";
-            break;
+    data->score = ours.score;
+    data->oppoScore = opponent.score;
+    updateKickoffMemory();
+    if (!isMotionAllowed()) {
+        tree->halt();
+        client->stopMotion();
     }
-    vector<string> gameSubStateMap = {"STOP", "GET_READY", "SET"};                               // STOP: 停下来; -> GET_READY: 移动到进攻或防守位置; -> SET: 站住不动
-    string gameSubState = gameSubStateMap[static_cast<int>(msg.secondary_state_info[1])];
-    tree->setEntry<string>("gc_game_sub_state_type", gameSubStateType);
-    tree->setEntry<string>("gc_game_sub_state", gameSubState);
-    bool isSubStateKickOffSide = (static_cast<int>(msg.secondary_state_info[0]) == config->teamId); // 在二级状态下, 我方是否是开球方. 例如, 当前二级状态为任意球, 我方是否是开任意球的一方
-    tree->setEntry<bool>("gc_is_sub_state_kickoff_side", isSubStateKickOffSide);
-
-    // cout << "game state: " << gameState << " game sub state type: " << gameSubStateType << endl;
-    // 找到队的信息
-    game_controller_interface::msg::TeamInfo myTeamInfo;
-    game_controller_interface::msg::TeamInfo oppoTeamInfo;
-    if (msg.teams[0].team_number == config->teamId)
-    {
-        myTeamInfo = msg.teams[0];
-        oppoTeamInfo = msg.teams[1];
-    }
-    else if (msg.teams[1].team_number == config->teamId)
-    {
-        myTeamInfo = msg.teams[1];
-        oppoTeamInfo = msg.teams[0];
-    }
-    else
-    {
-        // 数据包中没有包含我们的队，不应该再处理了
-        prtErr(format("received invalid game controller message team0 %d, team1 %d, teamId %d",
-            msg.teams[0].team_number, msg.teams[1].team_number, config->teamId));
-        return;
-    }
-
-    int liveCount = 0;
-    int oppoLiveCount = 0;
-    int gcGkIdx = -1; // GC 宣告的我队守门员下标
-    // 处理判罚状态. penalty[playerId - 1] 代表我方的球员是否处于判罚状态, 处理判罚状态意味着不能移动
-    for (int i = 0; i < HL_MAX_NUM_PLAYERS; i++) {
-        data->penalty[i] = static_cast<int>(myTeamInfo.players[i].penalty);
-
-        if (static_cast<int>(myTeamInfo.players[i].red_card_count) > 0) {
-            data->penalty[i] = PENALTY_SUBSTITUTE;
-        }
-
-        if (data->penalty[i] == PENALTY_NONE) liveCount++;
-
-        // 身份判定 (方案任务2): 读取 GC 包中的守门员旗标, 作为全队一致的权威 GK 身份源
-        if (myTeamInfo.players[i].goal_keeper) gcGkIdx = i;
-
-        data->oppoPenalty[i] = static_cast<int>(oppoTeamInfo.players[i].penalty);
-
-        if (static_cast<int>(oppoTeamInfo.players[i].red_card_count) > 0) {
-            data->oppoPenalty[i] = PENALTY_SUBSTITUTE;
-        }
-
-        if (data->oppoPenalty[i] == PENALTY_NONE) oppoLiveCount++;
-    }
-    data->liveCount = liveCount;
-    data->oppoLiveCount = oppoLiveCount;
-    data->gcGoalkeeperIdx = gcGkIdx;
-    data->gcGoalkeeperAlive = (gcGkIdx >= 0 && data->penalty[gcGkIdx] == PENALTY_NONE);
-
-    // cout << "penalty: " << data->penalty[0] << " " << data->penalty[1] << " " << data->penalty[2] << " " << data->penalty[3] << endl;
-    // cout << "oppo penalty: " << data->oppoPenalty[0] << " " << data->oppoPenalty[1] << " " << data->oppoPenalty[2] << " " << data->oppoPenalty[3] << endl;
-    bool lastIsUnderPenalty = tree->getEntry<bool>("gc_is_under_penalty");
-    bool isUnderPenalty = (data->penalty[config->playerId - 1] != PENALTY_NONE); // 当前 robot 是否被判罚中
-    tree->setEntry<bool>("gc_is_under_penalty", isUnderPenalty);
-    if (isUnderPenalty && !lastIsUnderPenalty) {
-        tree->setEntry<bool>("odom_calibrated", false); // 被判罚了, 则需要重新进场, 因此需要重新定位
-        if (config->tmBallShareEnable && teammateBall) teammateBall->reset(); // 重进场需重定位, 清陈旧共享球位
-    }
-
-    // log game state   
-    log->setTimeNow();
-    log->logToScreen(
-        "tick/gamecontrol",
-        format("Player: %d  Role: %s PrimaryStriker: %s GameState: %s  SubStateType: %s  SubState: %s UnderPenalty: %d isKickoff: %d isSubStateKickoff: %d", 
-            config->playerId, tree->getEntry<string>("player_role").c_str(), isPrimaryStriker() ? "Yes" : "No", gameState.c_str(), gameSubStateType.c_str(), gameSubState.c_str(), isUnderPenalty, isKickOffSide, isSubStateKickOffSide
-            ),
-        0xFFFFFFFF,
-        30.0
-    );
-
-    // FOR FUN 处理进球后的庆祝挥手的逻辑
-    data->score = static_cast<int>(myTeamInfo.score);
-    data->oppoScore = static_cast<int>(oppoTeamInfo.score);
 }
 
 void Brain::detectionsCallback(const vision_interface::msg::Detections &msg)
 {
-    // std::lock_guard<std::mutex> guard(data->brainMutex);
-    
-    // auto detection_time_stamp = msg.header.stamp;
-    // rclcpp::Time timePoint(detection_time_stamp.sec, detection_time_stamp.nanosec);
+    const auto timePoint = timePointFromHeader(msg.header);
+    const double ageMs = msecsSince(timePoint);
+    if (timePoint.nanoseconds() <= 0 || ageMs < 0.0 || ageMs > 650.0 ||
+        timePoint <= data->timeLastDet) return;
     data->camConnected = true;
-    auto timePoint = timePointFromHeader(msg.header);
-
-    auto now = get_clock()->now();
-    data->timeLastDet = timePoint; // 用于在调试中输出延迟信息
+    data->timeLastDet = timePoint;
 
     auto gameObjects = getGameObjects(msg);
 
@@ -2446,19 +2009,24 @@ void Brain::updateLinePosToField(FieldLine& line) {
 
 void Brain::fieldLineCallback(const vision_interface::msg::LineSegments &msg)
 {
-    // auto timestamp = msg.header.stamp;
-    // rclcpp::Time timePoint(timestamp.sec, timestamp.nanosec);
-    auto timePoint = timePointFromHeader(msg.header);
-
-    auto now = get_clock()->now();
-    data->timeLastLineDet = timePoint; // 用于在调试中输出延迟信息
+    const auto timePoint = timePointFromHeader(msg.header);
+    const double ageMs = msecsSince(timePoint);
+    if (timePoint.nanoseconds() <= 0 || ageMs < 0.0 || ageMs > 700.0 ||
+        timePoint <= data->timeLastLineDet || msg.coordinates.size() % 4 != 0 ||
+        msg.coordinates_uv.size() != msg.coordinates.size()) return;
+    data->timeLastLineDet = timePoint;
 
     vector<FieldLine> lines = {};
-    FieldLine line;
+    FieldLine line{};
 
     double x0, y0, x1, y1, __; // __ is a placeholder for transformations 
     for (int i = 0; i < msg.coordinates.size() / 4; i++) {
         int index = i * 4;
+        bool finite = true;
+        for (int j = 0; j < 4; ++j) {
+            finite = finite && std::isfinite(msg.coordinates[index + j]) && std::isfinite(msg.coordinates_uv[index + j]);
+        }
+        if (!finite) continue;
         line.posToRobot.x0 = msg.coordinates[index]; line.posOnCam.x0 = msg.coordinates_uv[index];
         line.posToRobot.y0 = msg.coordinates[index + 1]; line.posOnCam.y0 = msg.coordinates_uv[index + 1];
         line.posToRobot.x1 = msg.coordinates[index + 2]; line.posOnCam.x1 = msg.coordinates_uv[index + 2];
@@ -2735,32 +2303,17 @@ void Brain::headPoseCallback(const geometry_msgs::msg::Pose& msg)
 
 void Brain::recoveryStateCallback(const booster_interface::msg::RawBytesMsg &msg)
 {
-    // uint8_t state; // IS_READY = 0, IS_FALLING = 1, HAS_FALLEN = 2, IS_GETTING_UP = 3,  
-    // uint8_t is_recovery_available; // 1 for available, 0 for not available
-    // 使用 RobotRecoveryState 结构，将msg里面的msg转换为RobotRecoveryState
-    try
-    {
-        const std::vector<unsigned char>& buffer = msg.msg;
-        RobotRecoveryStateData recoveryState;
-        memcpy(&recoveryState, buffer.data(), buffer.size());
-
-        vector<RobotRecoveryState> recoveryStateMap = {
-            RobotRecoveryState::IS_READY,
-            RobotRecoveryState::IS_FALLING,
-            RobotRecoveryState::HAS_FALLEN,
-            RobotRecoveryState::IS_GETTING_UP
-        };
-        this->data->recoveryState = recoveryStateMap[static_cast<int>(recoveryState.state)];
-        this->data->isRecoveryAvailable = static_cast<bool>(recoveryState.is_recovery_available);
-        this->data->currentRobotModeIndex = static_cast<int>(recoveryState.current_planner_index);
-        
-        // cout << "recoveryState: " << static_cast<int>(recoveryState.state) << endl;
-        // cout << "recovery is available: " << static_cast<int>(recoveryState.is_recovery_available) << endl;
-        // cout << "current planner idx: " << static_cast<int>(recoveryState.current_planner_index) << endl;
-    }
-    catch(const std::exception& e)
-    {
-        std::cerr << e.what() << '\n';
+    if (msg.msg.size() != sizeof(RobotRecoveryStateData) || msg.msg[0] > 3 || msg.msg[1] > 1) return;
+    const auto previous = data->recoveryState;
+    data->recoveryState = static_cast<RobotRecoveryState>(msg.msg[0]);
+    data->isRecoveryAvailable = msg.msg[1] != 0;
+    data->currentRobotModeIndex = msg.msg[2];
+    if (data->recoveryState != RobotRecoveryState::IS_READY && previous == RobotRecoveryState::IS_READY) {
+        tree->halt();
+        client->stopMotion();
+        data->tmImInVisualKick = false;
+        data->tmImLead = false;
+        data->tmImAlive = false;
     }
 }
 
@@ -3001,8 +2554,11 @@ vector<GameObject> Brain::getGameObjects(const vision_interface::msg::Detections
 
     for (int i = 0; i < detections.detected_objects.size(); i++)
     {
-        auto obj = detections.detected_objects[i];
-        GameObject gObj;
+        const auto &obj = detections.detected_objects[i];
+        if (obj.position_projection.size() < 2 || !std::isfinite(obj.position_projection[0]) ||
+            !std::isfinite(obj.position_projection[1]) || !std::isfinite(obj.confidence) ||
+            obj.confidence < 0.0 || obj.confidence > 100.0) continue;
+        GameObject gObj{};
 
         gObj.timePoint = timePoint;
         gObj.label = obj.label;
@@ -3020,19 +2576,7 @@ vector<GameObject> Brain::getGameObjects(const vision_interface::msg::Detections
         gObj.boundingBox.ymin = obj.ymin;
         gObj.confidence = obj.confidence;
 
-        // 深度优先
-        // if (obj.position.size() > 0 && !(obj.position[0] == 0 && obj.position[1] == 0))
-        // { // 深度测距成功， 以深度测距为准
-        //     gObj.posToRobot.x = obj.position[0];
-        //     gObj.posToRobot.y = obj.position[1];
-        // }
-        // else
-        // { // 深度测距失败，以投影距离为准
-        //     gObj.posToRobot.x = obj.position_projection[0];
-        //     gObj.posToRobot.y = obj.position_projection[1];
-        // } // 注意，z 值没有用到
-
-        // 不用深度测距, 直接用投影距离
+        // Projected ground coordinates are the common calibrated measurement source.
         gObj.posToRobot.x = obj.position_projection[0];
         gObj.posToRobot.y = obj.position_projection[1];
 
@@ -3056,93 +2600,29 @@ vector<GameObject> Brain::getGameObjects(const vision_interface::msg::Detections
 
 void Brain::detectProcessBalls(const vector<GameObject> &ballObjs)
 {
-    static rclcpp::Time lastSeenRealBallTime;
-    double bestConfidence = 0;
-    int indexRealBall = -1;  // 认为哪一个球是真的, -1 表示没有检测到球
-
-    // 找出最可能的真球
-    for (int i = 0; i < ballObjs.size(); i++)
-    {
-        auto ballObj = ballObjs[i];
-        auto oldBall = data->ball;
-
-        // 防止把天上的灯识别为球
-        if (ballObj.posToRobot.x < -0.5 || ballObj.posToRobot.x > 15.0)
-            continue;
-
-        // 排除在场外太远的球, 注意这个功能会影响 cahse 等功能. 先不采用.
-        // if (isBallOut(2.0, 2.0))
-        //     continue;
-
-        // 如果检测出的球与上次看到的球, 距离和时间都很近, 则对其 confidence 进行适当加分
-        // double c = ballObj.confidence;
-        // double oldC = oldBall.confidence;
-        // double msecs = msecsSince(oldBall.timePoint);
-        // double dist = norm(ballObj.posToField.x - oldBall.posToField.x, ballObj.posToField.y - oldBall.posToField.y);
-        // ballObj.confidence += 0.5 * max(oldC, 0.0) * max(1 - msecs/1000, 0.0) * max(1 - dist / 2, 0.0);
-        // ballObj.confidence = min(100.0, ballObj.confidence);
-        // log->setTimeNow();
-        // log->log("/debug/oldc_newc", rerun::TextLog(format(
-        //     "oldc: %.2f  newc: %.2f",
-        //     oldC,
-        //     ballObj.confidence
-        // )));
-
-        // 判断: 如果置信度太低, 则认为是误检
-        if (ballObj.confidence < config->ballConfidenceThreshold)
-            continue;
-
-        // TODO 加入更多排除参数, 例如在身体上, 明显在球场外, 位置突然大幅度变化等
-        // 被遮挡的条件要加入. 如果突然消失, 没有遮挡的话, 则只相信一小会儿, 如果有遮挡, 可以相信比较长的时间.
-
-        // 找出剩下的球中, 置信度最高的
-        if (ballObj.confidence > bestConfidence)
-        {
-            bestConfidence = ballObj.confidence;
-            indexRealBall = i;
-        }
+    const GameObject *best = nullptr;
+    for (const auto &ball : ballObjs) {
+        const double age = msecsSince(ball.timePoint);
+        if (ball.timePoint.nanoseconds() <= 0 || age < 0.0 || age > 650.0 ||
+            !std::isfinite(ball.confidence) || ball.confidence < config->ballConfidenceThreshold ||
+            ball.confidence > 100.0 || !std::isfinite(ball.range) || ball.range <= 0.05 ||
+            !std::isfinite(ball.posToRobot.x) || !std::isfinite(ball.posToRobot.y) ||
+            !std::isfinite(ball.posToField.x) || !std::isfinite(ball.posToField.y) ||
+            ball.posToRobot.x < -0.5 || ball.posToRobot.x > 15.0) continue;
+        if (!best || ball.confidence > best->confidence) best = &ball;
     }
-
-    auto now = this->get_clock()->now();
-
-    if (indexRealBall >= 0)
-    { // 检测到球了
-        data->ballDetected = true;
-
-        data->ball = ballObjs[indexRealBall];
-        data->ball.confidence = bestConfidence;
-
+    data->ballDetected = best != nullptr;
+    if (best) {
+        data->ball = *best;
+        data->lose_ball = false;
         tree->setEntry<bool>("ball_location_known", true);
         updateBallOut();
-
-        lastSeenRealBallTime = now;
-        data->lose_ball = false;        
+    } else {
+        data->ball.boundingBox = BoundingBox{};
+        data->lose_ball = true;
     }
-    else
-    { // 没有检测到球
-        log->setTimeNow();
-        // log->log("image/detection_boxes_realball", rerun::Clear::FLAT);
-        data->ballDetected = false;
-        data->ball.boundingBox.xmin = 0;
-        data->ball.boundingBox.xmax = 0;
-        data->ball.boundingBox.ymin = 0;
-        data->ball.boundingBox.ymax = 0;
-
-        if (lastSeenRealBallTime.seconds() > 0.0)
-        {
-            double msecs = (now - lastSeenRealBallTime).nanoseconds() / 1e6;
-            data->lose_ball = (msecs > 2000.0);
-        }
-        else
-        {
-            data->lose_ball = false;
-        }
-
-        // data->ball.confidence = 0; // DO NOT set confidence to 0, confidence decay depends on this.
-    }
-
-    // 计算机器人到球的向量, 在 field 坐标系中的方向
-    data->robotBallAngleToField = atan2(data->ball.posToField.y - data->robotPoseToField.y, data->ball.posToField.x - data->robotPoseToField.x);
+    data->robotBallAngleToField = atan2(data->ball.posToField.y - data->robotPoseToField.y,
+        data->ball.posToField.x - data->robotPoseToField.x);
     updateBallPrediction();
 }
 
@@ -3624,7 +3104,7 @@ void Brain::updateRelativePos(GameObject &obj) {
     obj.posToRobot.y = pr.y;
     obj.range = norm(obj.posToRobot.x, obj.posToRobot.y);
     obj.yawToRobot = atan2(obj.posToRobot.y, obj.posToRobot.x);
-    obj.pitchToRobot = asin(config->robotHeight / obj.range);
+    obj.pitchToRobot = atan2(config->robotHeight, obj.range);
 }
 
 void Brain::updateFieldPos(GameObject &obj) {
@@ -3637,7 +3117,7 @@ void Brain::updateFieldPos(GameObject &obj) {
     obj.posToField.y = pf.y;
     obj.range = norm(obj.posToRobot.x, obj.posToRobot.y);
     obj.yawToRobot = atan2(obj.posToRobot.y, obj.posToRobot.x);
-    obj.pitchToRobot = asin(config->robotHeight / obj.range);
+    obj.pitchToRobot = atan2(config->robotHeight, obj.range);
 }
 
 void Brain::depthImageCallback(const sensor_msgs::msg::Image &msg)
@@ -4076,7 +3556,7 @@ string Brain::getComLogString() {
         ss << " P" << idx + 1 << " ";
     }
     ss << "]";
-    ss << "  Alive: " << aliveCnt << "  TMCMDID: " << data->tmCmdId << "  ReceivedDMD: " << data->tmReceivedCmd << "\n";
+    ss << "  Alive: " << aliveCnt << "  Owner: " << data->ballOwnerId << "\n";
     ss << "GK: gcFlag=" << (data->gcGoalkeeperIdx >= 0 ? to_string(data->gcGoalkeeperIdx + 1) : "-")
        << "  acting=" << data->actingGoalieId
        << "  KickoffGuard: " << (data->kickoffGuardActive ? "ON" : "off") << "\n";
@@ -4087,7 +3567,6 @@ string Brain::getComLogString() {
         ss << GREEN_CODE << "YES" << CYAN_CODE;
     else
         ss << RED_CODE << "NO" << CYAN_CODE;
-    ss << "    TMCMD: " << data->tmCmdId << format("\tCMD: [%d]%d", data->tmMyCmdId, data->tmMyCmd);
     ss << "\n";
 
     // Teammates info
@@ -4106,7 +3585,6 @@ string Brain::getComLogString() {
             ss << GREEN_CODE << "YES" << CYAN_CODE;
         else
             ss << RED_CODE << "NO" << CYAN_CODE;
-        ss << "\tCMD: " << format("[%d]%d", status.cmdId, status.cmd);
         ss << "\tLag: " << format("%.0f", msecsSince(status.timeLastCom)) << "ms" << "\n";
     }
     ss << "\n";

@@ -95,6 +95,27 @@ if(BUILD_TESTING)
   set(ament_cmake_cpplint_FOUND TRUE)
   ament_lint_auto_find_test_dependencies()
 
+  add_executable(match_policy_test test/match_policy_test.cpp)
+  target_include_directories(match_policy_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_features(match_policy_test PRIVATE cxx_std_17)
+  add_test(NAME match_policy_test COMMAND match_policy_test)
+
+  add_executable(motion_policy_test test/motion_policy_test.cpp)
+  target_include_directories(motion_policy_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_features(motion_policy_test PRIVATE cxx_std_17)
+  add_test(NAME motion_policy_test COMMAND motion_policy_test)
+
+  add_executable(team_wire_test test/team_wire_test.cpp)
+  target_include_directories(team_wire_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_features(team_wire_test PRIVATE cxx_std_17)
+  ament_target_dependencies(team_wire_test k1_teammate_ball)
+  add_test(NAME team_wire_test COMMAND team_wire_test)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(match_policy_test PRIVATE -UNDEBUG)
+    target_compile_options(motion_policy_test PRIVATE -UNDEBUG)
+    target_compile_options(team_wire_test PRIVATE -UNDEBUG)
+  endif()
+
   ament_add_gtest(formation_test
     test/formation_test.cpp
     src/formation.cpp)

@@ -6,12 +6,16 @@
       <ReactiveSequence >
          <SelfLocate mode="trust_direction" />
          <SubTree ID="Locate" _autoremap="true" _while="decision!='find'" />
-         <ReactiveSequence _while="wait_for_opponent_kickoff" name="等待对方开球">
+         <ReactiveSequence _while="penalty_kick_active &amp;&amp; penalty_kick_defending" name="守门员点球站位">
+            <SubTree ID="CamFindAndTrackBall" _autoremap="true" />
+            <GoToGoalBlockingPosition dist_tolerance="0.05" theta_tolerance="0.05" vx_limit="0.5" vy_limit="0.4" dist_to_goalline="0.05" />
+         </ReactiveSequence>
+         <ReactiveSequence _while="wait_for_opponent_kickoff &amp;&amp; gc_game_phase!=1 &amp;&amp; !penalty_kick_active" name="等待对方开球">
             <!-- <PrintMsg msg="等待对方开球"/> -->
             <SubTree ID="CamFindAndTrackBall" _autoremap="true" />
             <SetVelocity />
          </ReactiveSequence>
-         <ReactiveSequence _while="!wait_for_opponent_kickoff" name="已方开球或对方已经开球">
+         <ReactiveSequence _while="!wait_for_opponent_kickoff &amp;&amp; gc_game_phase!=1 &amp;&amp; !penalty_kick_active" name="已方开球或对方已经开球">
             <Sequence _while="ball_out">
                <SubTree ID="CamFindAndTrackBall" _autoremap="true" />
                <!-- <SetVelocity /> -->

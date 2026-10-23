@@ -25,15 +25,16 @@ struct FusedBall {
     double x = 0.0;
     double y = 0.0;
     double confidence = 0.0;
-    bool is_fresh = false;      // 本次是否有新的当前帧来源 (false 表示处于超时保持期)
+    bool is_fresh = false;      // 本次是否首次融合该观测
+    double source_stamp_sec = 0.0; // 实际球观测时间戳 (秒), 保持期不改变
 };
 
 struct Config {
     bool enable = false;                   // 是否启用高置信度球位共享
     double min_confidence_to_share = 50.0; // 自己置信度高于此值才视为"可共享" (发送侧/调试用)
     double min_confidence_to_trust = 50.0; // 队友球置信度高于此值才纳入融合 (核心: 高置信度门控)
-    double trust_timeout_sec = 1.0;        // 无新可信来源时, 维持上次结果的最长时间 (与原 brain 的 TM_BALL_TIMEOUT 对齐)
-    double self_dist_threshold = 2.0;      // 队友球须距我超过此值才采信 (规避双方定位误差造成的大方向误判)
+    double trust_timeout_sec = 1.0;        // 无新可信来源时, 维持上次结果的最长时间
+    double self_dist_threshold = 2.0;      // 队友球须距我超过此值才采信
     double teammate_timeout_sec = 1.0;     // 队友报告超过此时长视为过期
     bool require_location_known = true;    // 是否要求队友 location_known 才采信
 };
@@ -56,21 +57,27 @@ public:
     // 发送侧门控: 自己的球是否达到"可共享"标准 (确实看到 且 置信度足够)。
     bool shouldShare(double local_confidence, bool local_detected) const;
 
-    // 录入一条队友报告 (按 player_id 保留最新一条)。
-    void ingest(const BallReport &report);
+    // 录入一条有效队友报告; now_sec 为接收端当前时间, 同一 player_id 仅接受严格更新的观测时间戳。
+    void ingest(const BallReport &report, double now_sec);
 
-    // 基于已录入的队友报告 + 自身位姿, 计算融合后的队伍球位。
-    //   now_sec: 当前时间(秒)。self_location_known 预留(当前不强制, 由调用方决定如何使用 reliable)。
+    // 基于已录入的队友报告 + 已知自身位姿, 计算融合后的队伍球位。
+    // now_sec 反向跳变时会清空此前报告与保持状态。
     FusedBall fuse(double self_x, double self_y, bool self_location_known, double now_sec);
 
     // 清空状态 (例如重新定位 / 比赛重置时)。
     void reset();
 
 private:
+    struct StoredReport {
+        BallReport report;
+        bool consumed = false;
+    };
+
     Config cfg_;
-    std::map<int, BallReport> reports_; // player_id -> 最新报告
-    FusedBall last_reliable_;           // 上次可信结果 (用于超时保持)
-    double last_reliable_sec_ = -1e9;
+    std::map<int, StoredReport> reports_; // player_id -> 最新报告及是否已作为新观测融合
+    FusedBall last_reliable_;             // 上次可信结果 (保持截止时间由 source_stamp_sec 决定)
+    double last_now_sec_ = 0.0;
+    bool has_last_now_sec_ = false;
 };
 
 } // namespace k1_teammate_ball

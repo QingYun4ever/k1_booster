@@ -237,10 +237,20 @@ void BrainConfig::handle()
         throw invalid_argument("player_role must be one of [striker, goal_keeper]. Got: " + playerRole);
     }
 
-    // playerId
-    if (playerId < 1 || playerId > HL_MAX_NUM_PLAYERS)
-    {
-        throw invalid_argument("[Error] player_id must be one of [1, .. 11]. Got: " + to_string(playerId));
+    if (teamId < 1 || teamId > 254 || numOfPlayers < 1 || numOfPlayers > HL_MAX_NUM_PLAYERS ||
+        playerId < 1 || playerId > numOfPlayers || goalkeeperId < 1 || goalkeeperId > numOfPlayers) {
+        throw invalid_argument("team_id must be 1..254 and player/goalkeeper IDs must be within number_of_players");
+    }
+    if (!std::isfinite(gameControllerTimeoutMs) || gameControllerTimeoutMs <= 0.0 ||
+        !std::isfinite(vxLimit) || !std::isfinite(vyLimit) || !std::isfinite(vthetaLimit) ||
+        vxLimit <= 0.0 || vyLimit <= 0.0 || vthetaLimit <= 0.0) {
+        throw invalid_argument("controller timeout and motion limits must be finite and positive");
+    }
+    if (!std::isfinite(robotHeight) || robotHeight <= 0.0 || !std::isfinite(vxFactor) || vxFactor <= 0.0 ||
+        !std::isfinite(robotOdomFactor) || robotOdomFactor <= 0.0 || !std::isfinite(yawOffset) ||
+        !std::isfinite(ballConfidenceThreshold) || ballConfidenceThreshold < 0.0 || ballConfidenceThreshold > 100.0 ||
+        rerunLogImgInterval < 1) {
+        throw invalid_argument("robot geometry, confidence and image-log interval must be valid");
     }
 
     // fieldType [adult_size, kid_size]
@@ -273,8 +283,10 @@ void BrainConfig::handle()
     if (visualKickPowerMode != "distance" && visualKickPowerMode != "legacy") {
         throw invalid_argument("[Error] RLVisionKick.power_mode must be one of [distance, legacy]. Got: " + visualKickPowerMode);
     }
-    if (visualKickPowerMin > visualKickPowerMax) {
-        throw invalid_argument("[Error] RLVisionKick.power_min must be <= power_max.");
+    if (!std::isfinite(visualKickPowerMin) || !std::isfinite(visualKickPowerMax) ||
+        !std::isfinite(visualKickPowerOvershoot) || visualKickPowerMin < 0.0 ||
+        visualKickPowerMin > visualKickPowerMax) {
+        throw invalid_argument("RLVisionKick power must be finite, nonnegative and ordered");
     }
 
     calcMapLines();
@@ -293,6 +305,8 @@ void BrainConfig::print(ostream &os)
     os << "    playerStartPos = " << playerStartPos << endl;
     os << "    treatPersonAsRobot = " << treatPersonAsRobot << endl;
     os << "    numOfPlayers = " << numOfPlayers << endl;
+    os << "    goalkeeperId = " << goalkeeperId << endl;
+    os << "    gameControllerTimeoutMs = " << gameControllerTimeoutMs << endl;
     os << "----------------------------------------" << endl;
     os << "Robot:" << endl;
     os << "    robotHeight = " << robotHeight << endl;

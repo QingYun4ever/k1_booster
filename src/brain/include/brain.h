@@ -18,6 +18,8 @@
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <k1_ball_predictor/ball_motion_predictor.hpp>
 #include <k1_teammate_ball/teammate_ball_sharing.hpp>
+#include "match_policy.h"
+#include "team_strategy.h"
 
 #include "booster_interface/msg/odometer.hpp"
 #include "booster_interface/msg/low_state.hpp"
@@ -89,6 +91,11 @@ public:
     // 在 ros2 循环中调用
     void tick();
 
+    bool isMotionAllowed() const;
+    bool isRecoveryAllowed() const;
+    bool isKickAllowed() const;
+    bool hasFreshLocalBall(double maxAgeMs = 650.0) const;
+
     // 处理特殊状态, 如发球状态, 任意球发球状态等
     void handleSpecialStates();
 
@@ -141,7 +148,7 @@ public:
     double distToBorder();
 
     // 判断当前是否处于防守位置, 如对方开任意球之前
-    bool isDefensing();
+    bool isDefensing() const;
 
     // bounding box 是否位于屏幕的中心范围内
     bool isBoundingBoxInCenter(BoundingBox boundingBox, double xRatio = 0.8, double yRatio = 0.8);
@@ -245,7 +252,7 @@ public:
 
     double calcAvoidDir(double startAngle, double safeDist);
 
-    // 返回当前比赛逻辑认可的守门员 playerId。已确认的临时交接优先于仍未更新的 GC 旗标。
+    // GC/configured goalkeeper remains authoritative until penalized.
     int getEffectiveGoalkeeperId() const;
 
 
@@ -270,9 +277,6 @@ private:
     // 处理多机配合逻辑
     void handleCooperation();
 
-    // 身份判定 (方案任务2): 根据 GC 守门员旗标 + 存活情况, 决定性地分配 player_role.
-    // 规则 R0-R5 见 docs/2026-07-10_方案落地_实施计划.md §4.3. 由 handleCooperation 调用.
-    void updateRoleAssignment(const vector<int> &aliveTmIdxs, int gcAliveCount);
 
     // ------------------------------------------------------ 视觉处理 ------------------------------------------------------
 
@@ -327,7 +331,7 @@ private:
 
     void updateLogFile();
 
-    rclcpp::Subscription<sensor_msgs::msg::Joy>::SharedPtr joySubscription;
+    rclcpp::Subscription<booster_interface::msg::RemoteControllerState>::SharedPtr remoteControllerSubscription;
     rclcpp::Subscription<game_controller_interface::msg::GameControlData>::SharedPtr gameControlSubscription;
     rclcpp::Subscription<vision_interface::msg::Detections>::SharedPtr detectionsSubscription;
     rclcpp::Subscription<vision_interface::msg::LineSegments>::SharedPtr subFieldLine;
@@ -345,6 +349,14 @@ private:
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr pubWebuiStatus;
     rclcpp::TimerBase::SharedPtr timer_;
     rclcpp::Time lastWebuiStatusPubTime_{0, 0, RCL_ROS_TIME};
+    match_policy::State matchState_;
+    uint8_t lastGameControllerPacket_ = 0;
+    bool gameTree_ = false;
+    bool waitingForPrimaryKickoff_ = false;
+    bool opponentRestartLatched_ = false;
+    Point opponentKickoffBall_{};
+    rclcpp::Time opponentKickoffTime_{0, 0, RCL_ROS_TIME};
+    int lastScore_ = 0;
 
     // ------------------------------------------------------ 调试 log 相关 ------------------------------------------------------
     void logObstacleDistance();

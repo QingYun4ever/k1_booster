@@ -77,11 +77,7 @@ def handle_configuration(context, *args, **kwargs):
             package ='brain',
             executable='brain_node',
             output='screen',
-            parameters=[
-                config_file,
-                config_local_file,
-                config
-            ]
+            parameters=[path for path in [config_file, config_local_file] if os.path.isfile(path)] + [config]
         )
     ]
 

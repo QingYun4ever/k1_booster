@@ -2,12 +2,14 @@ brain_node:
   ros__parameters:
     game:
       team_id: 31 # consistant with GameControl
-      player_id: 1 # 1 | 2 | 3 | 4 | 5
+      player_id: 1 # 1 | 2 | 3; unique per robot
       field_type: "adult_size" # adult_size | kid_size | robo_league
       player_role: "striker" # striker | goal_keeper
       player_start_pos: "right" # right | left
       treat_person_as_robot: false # 是否将人类视为机器人, 用于调试. !!!! 正式比赛时, 必须设置为 false !!!!
       number_of_players: 3
+      goalkeeper_id: 3 # Same team-wide fallback when GC does not specify a goalkeeper
+      controller_timeout_ms: 2000.0
     
     ball_predictor: 
       step_interval: 100. 
@@ -55,9 +57,9 @@ brain_node:
       odom_factor: 1.2 
       vx_factor: 0.90 
       yaw_offset: 0.0 
-      vx_limit: 2.0
-      vy_limit: 0.8
-      vtheta_limit: 2.4
+      vx_limit: 1.2
+      vy_limit: 0.5
+      vtheta_limit: 1.5
 
     strategy:
       ball_confidence_threshold: 30.0 
@@ -65,10 +67,10 @@ brain_node:
       enable_stable_kick: false 
       ball_memory_timeout: 3.0 
       tm_ball_dist_threshold: 1.5  
-      limit_near_ball_speed: false 
+      limit_near_ball_speed: true
       near_ball_speed_limit: 0.6 
       near_ball_range: 2.0 
-      soft_kickoff: false 
+      soft_kickoff: true
       soft_kickoff_speed: 0.3 
       kick_range: 1.0
       kick_theta_range: 0.2
@@ -105,15 +107,10 @@ brain_node:
       auto_visual_kick_enable_dist_max: 4.0
       auto_visual_kick_enable_angle: 0.8
       cooperation:
-        enable_role_switch: true
-        ball_control_cost_threshold: 5.0
+        owner_switch_margin: 0.3 # Retain one confirmed owner unless another is clearly cheaper
 
-      # 身份判定 (方案任务2). enable=false 时完全回到旧 switchRole 行为.
       role_assignment:
-        enable: true
-        gk_takeover: true       # GK 罚下时是否选举最小 ID 存活者接任守门
-        lead_hold_msecs: 500.0  # lead(控球) 滞回, 防两机 cost 接近时抖动
-        handover_confirm_timeout_msecs: 2000.0 # 原 GK 等待接任者周期角色确认的最长时间; 超时保持原 GK
+        gk_takeover: true # GC penalized goalkeeper -> smallest eligible ID; no active handover
 
       # 开球后触球前禁用 vision kick (方案任务1). 我方开球/任意球期间, 第一脚必须趟球触球而非 RL 视觉射门.
       kickoff_guard:
@@ -175,10 +172,10 @@ brain_node:
 
     # 队友间高置信度球位置共享 (独立 package k1_teammate_ball)。传输复用 enable_com 的底层 UDP 通讯。
     teammate_ball_share:
-      enable: true                    # 是否启用高置信度球位共享/融合 (关闭时沿用原有按距离选最近队友球的逻辑)
+      enable: true # false disables sharing instead of selecting ungated teammate reports
       min_confidence_to_share: 50.0   # 自己置信度高于此值才视为可共享 (发送侧/调试用)
       min_confidence_to_trust: 50.0   # 队友球置信度高于此值才纳入融合 (核心: 高置信度门控)
-      trust_timeout: 1.0              # 无新可信来源时维持上次结果的最长秒数
+      trust_timeout: 1.0 # Maximum age from actual source observation; fusion never renews it
       self_dist_threshold: 2.0        # 队友球须距我超过此值(m)才采信, 规避双方定位误差造成的大方向误判
       teammate_timeout: 1.0           # 队友报告超过此秒数视为过期
       require_location_known: true    # 是否要求队友自认球位已知才采信

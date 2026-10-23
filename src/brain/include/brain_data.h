@@ -29,6 +29,13 @@ public:
     int oppoScore = 0;
     int penalty[HL_MAX_NUM_PLAYERS]; // 我方机器人 penalty 状态
     int oppoPenalty[HL_MAX_NUM_PLAYERS]; // 对方所有机器人 penalty 状态
+    bool gcReceived = false;
+    bool gcStopped = true;
+    int gcGamePhase = 0;
+    int gcSetPlay = 0;
+    int gcPlayersPerTeam = 0;
+    int gcProtocolVersion = 0;
+    int gcSecondaryTime = 0;
     bool isKickingOff = false; // 是否在刚刚发球的状态, 持续 10 秒
     rclcpp::Time kickoffStartTime; // 发球开始的时间
     bool isFreekickKickingOff = false; // 是否在任意球发球的开始状态, 持续 10 秒
@@ -40,12 +47,7 @@ public:
     // 身份判定 (方案任务2): GameController 包中我队被裁判机指定的守门员. 这是全队天然一致的权威 GK 身份源.
     int gcGoalkeeperIdx = -1;      // GC 宣告的我队守门员下标 (playerId-1); -1 = GC 未指定
     bool gcGoalkeeperAlive = false; // 该守门员当前是否在场 (penalty==NONE)
-    int actingGoalieId = -1;        // 守门->前锋交接产生的"临时守门员" playerId(1-based); -1=无交接. 供角色判定识别, 防原 GK 被拉回守门与临时 GK 并存.
-    int pendingGoalieId = -1;       // 原 GK 正在等待该球员通过周期角色状态确认接任; 确认前原 GK 继续守门.
-    rclcpp::Time pendingGoalieRequestTime;
-
-    // lead(控球) 滞回, 防止两机 cost 接近时每 tick 抖动
-    rclcpp::Time tmLastLeadFlipTime; // 上次 lead 状态翻转的时间
+    int actingGoalieId = -1; // Deterministic replacement for a penalized designated goalkeeper
 
     // 开球触球前禁用 vision kick (方案任务1). 由 handleSpecialStates 维护.
     bool kickoffGuardActive = false;    // true = 我方开球窗口内且第一脚触球未完成, 期间禁止 auto_visual_kick / RLVisionKick
@@ -54,6 +56,7 @@ public:
     Pose2D kickoffGuardOdomToField;       // 锁存球位时的定位变换, 用于识别 field 系单帧跳变
     int kickoffGuardMoveConfirmCount = 0; // 连续超过移动阈值的可信观测数
     rclcpp::Time kickoffGuardWindowStart; // 开球窗口起点 (摆位期间持续刷新, 进入比赛后开始 10s 倒计时)
+    rclcpp::Time kickoffGuardLastObservation{0, 0, RCL_ROS_TIME};
 
     // 站位 (方案任务4). 由 GoToFormationSlot 节点更新, CalcKickDir 消费.
     string formationSlotName = "";       // 本机当前被分配的槽位语义名 (passer/shooter/kicker/receiver/L1a/...); 空=未分配
@@ -162,16 +165,12 @@ public:
 
     // 双机配合, tm: teammate
     TMStatus tmStatus[HL_MAX_NUM_PLAYERS]; // 队友间通讯传达的状态, 数组的 idx 为 player_id - 1;
-    int tmCmdId = 0; // 全队最新的 cmdId, 每个队员发布新指令时, 此值都加 1;
-    rclcpp::Time tmLastCmdChangeTime; // 最后一次收到或发送新指令的时间
-    int tmMyCmd = 0; // 我最后发出的指令;
-    int tmMyCmdId = 0; // 我最后发出的指令的 ID; 
-    int tmReceivedCmd = 0; // 收到队友的指令. 当 tmCmdId 与收到的 cmdId 不同时, 这个值会被更新为收到的 Cmd, 执行后会回到 0;
-    bool tmImLead = true; // 当前我是否在控球.
-    bool tmImAlive = true; // 当前我是否在上场中. 以裁判机为准.
+    bool tmImLead = false;
+    bool tmImAlive = false;
     double tmMyCost = 0.; // 我接近球的成本, 用于多机配合. 基本上 cost 相当于我踢到球需要花的秒数.
     int tmMyCostRank = 0; // 我接近球的成本排名, 用于多机配合. 基本上 cost 相当于我踢到球需要花的秒数.
     int myStrikerIDRank = 0; // 我的 ID 在前锋中的排名, 用于多机配合. 
+    int ballOwnerId = 0;
     bool tmImInVisualKick = false; // 自己是否处于 visual kick 模式
     bool shouldExitRLVisionKick = false; // 是否需要主动退出 visual kick 模式
 

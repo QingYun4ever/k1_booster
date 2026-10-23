@@ -5,6 +5,7 @@
 #pragma once
 
 #include <string>
+#include <cstdint>
 #include <vector>
 #include <numeric>
 #include <iterator>
@@ -196,14 +197,16 @@ struct TMStatus {
     double ballConfidence = 0.;
     double ballRange = 0.;
     double cost = 0.; // 计算从当前状态到能踢到球的成本
-    bool isLead = true; // 是否在控球状态
-    Point ballPosToField;
-    Pose2D robotPoseToField;
+    bool isLead = false;
+    Point ballPosToField{};
+    Pose2D robotPoseToField{};
     double kickDir = 0.; // 预计的踢球方向
     double thetaRb = 0.; // 机器人到球的角度, field 坐标系
-    int cmd = 0; // 最后一次发出的指令 
-    int cmdId = 0; // 最后一次发出的指令 ID
     rclcpp::Time timeLastCom; // 最后一次通讯时间
+    rclcpp::Time ballObservationTime; // 接收端时钟下估算的最新球观测时间
+    uint32_t communicationId = 0; // 最新已接收的有序通信包序号
+    uint32_t ballObservationId = 0; // 球观测序号, 心跳包不刷新 observation time
+    bool isInVisualKick = false; // 队友是否正在执行视觉踢球技能
 };
 
 
