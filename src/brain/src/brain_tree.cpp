@@ -746,112 +746,51 @@ NodeStatus GoToGoalBlockingPosition::tick() {
     return NodeStatus::SUCCESS;
 }
 
-NodeStatus Assist::tick() {
-    auto log = [=](string msg) {
-        brain->log->setTimeNow();
-        brain->log->log("debug/Assist", rerun::TextLog(msg));
-    };
-    log("ticked");
-
-    double distTolerance = getInput<double>("dist_tolerance").value();
-    double thetaTolerance = getInput<double>("theta_tolerance").value();
-    double distToGoalline = getInput<double>("dist_to_goalline").value();
-
-    auto fd = brain->config->fieldDimensions;
-    auto ballPos = brain->data->ball.posToField;
-    auto robotPose = brain->data->robotPoseToField;
-    Pose2D targetPose = {0.0, 0.0, 0.0};
-
-    const double ownGoalX = -fd.length / 2.0;
-    const double oppGoalX = fd.length / 2.0;
-    const int rank = brain->data->tmMyCostRank;
-    const bool aggressiveAssist = brain->data->liveCount >= 3; // 3 人以上时，允许更积极的前插接应
-
-    auto calcBlockLineY = [&](double targetX) {
-        const double denom = ballPos.x - ownGoalX;
-        if (fabs(denom) < 1e-6) {
-            return 0.0;
-        }
-        return ballPos.y * (targetX - ownGoalX) / denom;
-    };
-
-    // rank 0 在 Assist 状态下是异常情况（通常是只剩我自己或切换瞬间），这里退化为 rank 1 逻辑.
-    // 
-    if (brain->data->tmMyCostRank == 0) {
-        // Bug 修复：当没有队友在线（或我是 cost 最低的）时，也需要计算防守位置
-        // 这种情况发生在：队友被罚下，但我仍然处于 Assist 状态
-        targetPose.x = ballPos.x - 2.0;
-        targetPose.x = max(targetPose.x, - fd.length / 2.0 + distToGoalline); // 不要太接近底线
-        targetPose.y = ballPos.y * (targetPose.x + fd.length / 2.0) / (ballPos.x + fd.length / 2.0); // 可以挡住球的位置
-        log("tmMyCostRank == 0, using default assist position");
-    } else if (brain->data->tmMyCostRank == 1) {
-        targetPose.x = ballPos.x - 2.0;
-        targetPose.x = max(targetPose.x, - fd.length / 2.0 + distToGoalline); // 不要太接近底线
-        targetPose.y = ballPos.y * (targetPose.x + fd.length / 2.0) / (ballPos.x + fd.length / 2.0); // 可以挡住球的位置
-    } else if (brain->data->tmMyCostRank == 2) {  //todo 之后的assist时候的tmMyCostRank不考虑守门员的cost
-        // targetPose.x = ballPos.x - 2.0;
-        // targetPose.x = max(targetPose.x, - fd.length / 2.0 + distToGoalline); // 不要太接近底线
-        // targetPose.y = ballPos.y * (targetPose.x + fd.length / 2.0) / (ballPos.x + fd.length / 2.0); // 可以挡住球的位置
-        targetPose.x = -fd.length / 2.0 + fd.penaltyAreaLength + 1;
-        if (targetPose.x > ballPos.x) targetPose.x = ballPos.x - 1.0;
-        targetPose.y = ballPos.y * (targetPose.x + fd.length / 2.0) / (ballPos.x + fd.length / 2.0); // 可以挡住球的位置
-    } else if (brain->data->tmMyCostRank == 3) {
-        targetPose.x = -fd.length / 2.0 + fd.penaltyAreaLength;
-        if (targetPose.x > ballPos.x) targetPose.x = ballPos.x - 0.5;
-        targetPose.y = ballPos.y * (targetPose.x + fd.length / 2.0) / (ballPos.x + fd.length / 2.0); // 可以挡住球的位置
-    } else {
-        // tmMyCostRank >= 4 的情况，使用默认防守位置
-        targetPose.x = -fd.length / 2.0 + fd.penaltyDist;
-        if (targetPose.x > ballPos.x) targetPose.x = ballPos.x - 0.5;
-        targetPose.y = ballPos.y * (targetPose.x + fd.length / 2.0) / (ballPos.x + fd.length / 2.0);
-        log(format("tmMyCostRank = %d, using fallback position", brain->data->tmMyCostRank));
-    }
-
-    // 场地约束：防止辅助位冲出边界或压到对方禁区深处.
-    targetPose.x = cap(targetPose.x, oppGoalX - fd.penaltyAreaLength - 0.2, ownGoalX + distToGoalline);
-    targetPose.y = cap(targetPose.y, fd.width / 2.0 - 0.7, -fd.width / 2.0 + 0.7);
-     
-    double dist = norm(targetPose.x - robotPose.x, targetPose.y - robotPose.y);
-    if ( // 认为到达了目标位置
-        dist < distTolerance
-        && fabs(brain->data->ball.yawToRobot) < thetaTolerance
-    ) {
-        brain->client->setVelocity(0, 0, 0);
+NodeStatus Assist::tick()
+{
+    brain->data->supportTargetValid = false;
+    brain->data->supportRole = "hold";
+    if (!brain->isMotionAllowed() || brain->data->tmImLead) {
+        brain->client->setVelocity(0.0, 0.0, 0.0, false, false, false);
         return NodeStatus::SUCCESS;
     }
-
-    double vx, vy, vtheta;
-    auto targetPose_r = brain->data->field2robot(targetPose);
-    double targetDir = atan2(targetPose_r.y, targetPose_r.x);
-    double distToObstacle = brain->distToObstacle(targetDir);
-
-    bool avoidObstacle;
-    brain->get_parameter("obstacle_avoidance.avoid_during_chase", avoidObstacle);
-    double oaSafeDist;
-    brain->get_parameter("obstacle_avoidance.chase_ao_safe_dist", oaSafeDist);
-
-    if (avoidObstacle && distToObstacle < oaSafeDist) {
-        log("avoid obstacle");
-        auto avoidDir = brain->calcAvoidDir(targetDir, oaSafeDist);
-        const double speed = 0.5;
-        vx = speed * cos(avoidDir);
-        vy = speed * sin(avoidDir);
-        vtheta = brain->data->ball.yawToRobot;
-    } else {
-        vx = targetPose_r.x;
-        vy = targetPose_r.y;
-        vtheta = brain->data->ball.yawToRobot * 2.0; // 后面的乘数越大, 转身越快
+    if (_supportOwnerId != brain->data->ballOwnerId) {
+        _supportPlan = tactics::SupportPlan{};
+        _supportArrival = motion_policy::ArrivalLock{};
+        _supportOwnerId = brain->data->ballOwnerId;
     }
-
-
-    double vxLimit, vyLimit;
-    getInput("vx_limit", vxLimit);
-    getInput("vy_limit", vyLimit);
-    vx = cap(vx, vxLimit, -0.25);     // 进一步限速, 不允许后退速度过快.
-    vy = cap(vy, vyLimit, -vyLimit);     // 进一步限速
-     
-
-    brain->client->setVelocity(vx, vy, vtheta, false, false, false);
+    const auto world = brain->getTacticalWorld();
+    _supportPlan = tactics::chooseSupport(world, &_supportPlan);
+    if (!_supportPlan.valid) {
+        _supportArrival = motion_policy::ArrivalLock{};
+        brain->client->setVelocity(0.0, 0.0, 0.0, false, false, false);
+        return NodeStatus::SUCCESS;
+    }
+    const auto target = _supportPlan.target;
+    brain->data->supportTarget = {target.x, target.y, target.theta};
+    brain->data->supportTargetValid = true;
+    brain->data->supportRole = tactics::supportName(_supportPlan.role);
+    const double distTolerance = getInput<double>("dist_tolerance").value();
+    const double thetaTolerance = getInput<double>("theta_tolerance").value();
+    if (_supportArrival.shouldHold(target.x, target.y, target.theta, world.robot.x, world.robot.y,
+        world.robot.theta, distTolerance, thetaTolerance)) {
+        brain->client->setVelocity(0.0, 0.0, 0.0, false, false, false);
+        return NodeStatus::SUCCESS;
+    }
+    const auto relative = brain->data->field2robot({target.x, target.y, target.theta});
+    const double vxLimit = getInput<double>("vx_limit").value();
+    const double vyLimit = getInput<double>("vy_limit").value();
+    const double yaw = toPInPI(target.theta - world.robot.theta);
+    if (!std::isfinite(vxLimit) || !std::isfinite(vyLimit) || vxLimit <= 0.0 || vyLimit <= 0.0) {
+        brain->client->setVelocity(0.0, 0.0, 0.0, false, false, false);
+        return NodeStatus::SUCCESS;
+    }
+    double scale = 1.0;
+    const double xLimit = relative.x >= 0.0 ? vxLimit : std::min(vxLimit, 0.25);
+    if (fabs(relative.x) > xLimit) scale = std::min(scale, xLimit / fabs(relative.x));
+    if (fabs(relative.y) > vyLimit) scale = std::min(scale, vyLimit / fabs(relative.y));
+    brain->client->setVelocity(relative.x * scale, relative.y * scale,
+        cap(yaw * 1.5, 1.0, -1.0), false, false, false);
     return NodeStatus::SUCCESS;
 }
 

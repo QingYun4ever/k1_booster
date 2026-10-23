@@ -689,6 +689,8 @@ void Brain::tick()
         data->tmImInVisualKick = false;
     }
     // SET still permits non-motion localization; RobotClient gates every output.
+    data->supportTargetValid = false;
+    data->supportRole = "hold";
     tree->tick();
     pubKickMsg();
     communication->update();
@@ -878,6 +880,11 @@ string Brain::buildWebuiStatusJson() {
         appendNumber(oss, data->touchCosts[i]);
     }
     oss << ']';
+    oss << ",\"support_valid\":" << (data->supportTargetValid ? "true" : "false");
+    oss << ",\"support_role\":";
+    appendString(oss, data->supportRole);
+    oss << ",\"support_target\":";
+    appendPose2D(oss, data->supportTarget);
     oss << "}";
 
     oss << ",\"pose\":{\"field\":";

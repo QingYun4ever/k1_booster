@@ -60,6 +60,8 @@ struct SupportPlan {
     bool valid = false;
     Pose target;
     SupportRole role = SupportRole::Cover;
+    Point referenceBall;
+    Point referenceOwner;
 };
 
 inline bool finite(Point p) { return std::isfinite(p.x) && std::isfinite(p.y); }

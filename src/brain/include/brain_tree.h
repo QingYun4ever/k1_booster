@@ -12,6 +12,7 @@
 #include "types.h"
 #include "formation.h"
 #include "motion_policy.h"
+#include "tactical_support.h"
 
 class Brain;
 
@@ -691,12 +692,14 @@ public:
         return {
             InputPort<double>("dist_tolerance", 0.5, ""), InputPort<double>("theta_tolerance", 0.1, ""),
             InputPort<double>("vx_limit", 1.0, ""), InputPort<double>("vy_limit", 0.6, ""),
-            InputPort<double>("dist_to_goalline", 1.0, ""),
         };
     }
     BT::NodeStatus tick() override;
 private:
     Brain *brain;
+    tactics::SupportPlan _supportPlan;
+    motion_policy::ArrivalLock _supportArrival;
+    int _supportOwnerId = 0;
 };
 
 class SetVelocity : public SyncActionNode

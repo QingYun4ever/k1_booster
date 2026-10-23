@@ -31,7 +31,7 @@ python tools/check_native.py
 python configure_demo.py --help
 ```
 
-原生检查运行裁判解析、共享球、比赛门控/角色选择、队友协议与融合、动作进展/到位滞回，以及有效触球时序测试；同时检查行为树 XML、include/SubTree、配置和 Python 语法。它不替代 ROS 起树、DDS 传输或 SDK 动作验证。
+原生检查运行裁判解析、共享球、比赛门控/角色选择、队友协议与融合、动作进展/到位滞回、有效触球时序和动态接应测试；同时检查行为树 XML、include/SubTree、配置和 Python 语法。它不替代 ROS 起树、DDS 传输或 SDK 动作验证。
 
 ## Ubuntu / Jetson 构建与启动
 
