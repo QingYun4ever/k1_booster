@@ -27,6 +27,8 @@ def main():
         ("motion", ["src/brain/test/motion_policy_test.cpp"], ["src/brain/include"]),
         ("timing", ["src/brain/test/tactical_timing_test.cpp"], ["src/brain/include"]),
         ("support", ["src/brain/test/tactical_support_test.cpp"], ["src/brain/include"]),
+        ("kick", ["src/brain/test/tactical_kick_test.cpp"], ["src/brain/include"]),
+        ("decision", ["src/brain/test/tactical_decision_test.cpp"], ["src/brain/include"]),
     ]
     with tempfile.TemporaryDirectory(prefix="qybot-native-") as directory:
         for name, sources, includes in suites:

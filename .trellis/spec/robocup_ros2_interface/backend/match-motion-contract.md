@@ -10,6 +10,9 @@ Cross-layer contract for `game_controller_interface`, game-controller UDP, brain
 - `Brain::gameControlCallback(const GameControlData&)` commits a validated, own-team, ordered state.
 - `Brain::isRecoveryAllowed() const` applies the referee authorization; `isMotionAllowed() const` additionally requires ready recovery state.
 - `Brain::isKickAllowed() const` adds fresh local ball, calibrated odometry, lead ownership, in-field ball and restart authorization.
+- `Brain::updateKickPlan()` refreshes `data->tacticalKick` before every tree tick; calibration refreshes it after frame reprojection.
+- `tactics::chooseKick(const World&, double minimumWindowRadians = 0.18) -> KickPlan`; `chooseDecision(const DecisionInput&) -> Decision`.
+- `Brain::isVisualKickAllowed() const` adds a valid observed shooting route; `isGroundKickAllowed() const` checks alignment with the selected lane.
 - `RobotClient::stopMotion()` sends zero/cancels active skills even when starting is disallowed. Generic `call` is private.
 - `BrainCommunication::update()` runs on the ROS executor thread; socket workers only consume snapshots or enqueue packets.
 - `TeammateBallSharing::ingest(const BallReport&, double now_sec)` validates against the current receiver time.
@@ -26,6 +29,13 @@ Cross-layer contract for `game_controller_interface`, game-controller UDP, brain
 | Local ball | `data->ball` local camera observation/memory only; tmBall never overwrites it |
 | Fusion | source_stamp_sec retained through holds; repeated heartbeat/fusion cannot renew age |
 | Executor | One ROS executor serializes tick/GC/vision/joystick; bounded socket queue and locked immutable outbound snapshots |
+| Kick origin | Fresh local ball takes precedence over prediction/sharing; no stale direction survives an invalid plan |
+| Shot window | Ball-origin goal angles, 0.2m post margins; subtract inflated disk angular intervals, select a window at least 0.18rad |
+| Ground target | Forward candidate up to 1.5m, in-field with at least 0.02m disk clearance; a target is not a guarantee of actual rolling distance |
+| Pressure | Opponent-only arrival `(ball distance - disk radius)/1.2m/s`; own penalty danger or arrival <=0.9s prioritizes clearance |
+| Vision evidence | Fresh local ball, recent opponent-goal post, <=300ms finite convex ground footprint covering ball and selected target; calibration reprojects without renewing its timestamp |
+| Body transitions | Striker/goalkeeper action sequences are reactive; reserve visual ownership from deceleration; failed cancellation prevents another body action |
+| Kick payload | `/kick_ball` direction, robot-relative goal and distance-derived power all use the selected target, not unconditional goal center |
 | Deployment | All three robots clean protocol/interface cutover; no old teammate aliases; external GC v12/v20 supported intentionally |
 
 Configuration: team1..254, unique player1..number_of_players, common goalkeeper ID within roster, controller timeout positive. Vision configuration can use `QYBOT_VISION_CONFIG_PATH`; optional system tuning requires `QYBOT_TUNE_SYSTEM=1`. YAML precedence is base, optional local, launch override.
@@ -43,6 +53,9 @@ Configuration: team1..254, unique player1..number_of_players, common goalkeeper 
 | Duplicate source stamp / heartbeat | No new observation or renewed hold |
 | Invalid motion value | Stop/reject rather than serialize nonfinite numbers |
 | Missing blackboard entry | Explicit error, never uninitialized primitive |
+| No legal lane / insufficient goal window | Invalid Hold / safe ground Carry; never invent a fixed fallback or allow visual Carry/Clear |
+| Ground heading or approach misaligned | Adjust/stop; ground start and continuation use heading tolerance and <=0.12rad approach error |
+| Kickoff guard | No visual start; aligned first touch uses ground Cross |
 
 ## 5. Good / base / bad cases
 
@@ -50,10 +63,12 @@ Configuration: team1..254, unique player1..number_of_players, common goalkeeper 
 - Base: packet0 after packet255 is newer; three roster members ignore zero-filled unused storage slots.
 - Bad: receiving a heartbeat at time101 for an observation100 must not assign observation stamp101.
 - Bad: clearing visual-kick ownership during the deceleration interval before sending cancel permits two active actors.
+- Good: left goal-lane obstruction selects a clear right-side goal target; opponent arrival0.8s selects Clear.
+- Bad: a normal Sequence resumes its running kick child without re-running the previous decision; use ReactiveSequence at the action layer.
 
 ## 6. Tests required
 
-Run `python tools/check_native.py`: parser negative time/length/counts; source freshness/duplicates/future/reset; match stop/penalty/roster/owner; wire confidence80 and age into real fusion; motion progress distinct observations and arrival-release hysteresis. Release CTest targets must undefine NDEBUG so assert-based native regressions stay active.
+Run `python tools/check_native.py`: parser negative time/length/counts; source freshness/duplicates/future/reset; match stop/penalty/roster/owner; wire confidence80 and age into real fusion; motion distinct observations and arrival hysteresis; tactical timing/support; exact shot-window threshold, distinct full-capacity blockers, invalid/stale/degenerate view gates, ground/visual alignment, guarded touch and pressure-adjustment precedence. Floating geometric comparisons allow 1e-9m roundoff. Release CTest targets undefine NDEBUG.
 
 On a real robot also verify ROS message regeneration, BTCPP loading, DDS/SDK cancel, three-peer role behavior, point-penalty foot positioning and GC return acceptance. Native tests do not prove these runtime surfaces. A real UDP loopback replay has exercised the parser/match policy; see the migration changelog.
 
@@ -66,3 +81,7 @@ Correct: choose `getBallForChase()` for approach only; start a kick only when `h
 Wrong: network threads update `brain->tree` or `brain->data` directly.
 
 Correct: enqueue validated packets; apply them in `BrainCommunication::update()` on the serialized executor thread.
+
+Wrong: enable visual kick merely because a local ball is fresh, then publish the goal center even though the selected lane points elsewhere.
+
+Correct: require `tacticalKick.visualKickAllowed`; publish `tacticalKick.target` and its direction, and retain ownership until cancellation succeeds.

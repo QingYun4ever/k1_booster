@@ -74,34 +74,16 @@ brain_node:
       soft_kickoff_speed: 0.3 
       kick_range: 1.0
       kick_theta_range: 0.2
-      adjust_timeout_secs: 0.0  # >0: adjust(绕球对位)持续超过该秒数则强制退回 chase, 防绕球死锁; 0=关闭(默认,行为不变)
+      adjust_timeout_secs: 0.0  # 0=不设额外固定超时；对手触球时间仍会缩短对位预算
       abort_kick_when_ball_moved: true 
       abort_kick_ball_move_threshold: 0.3 
-      abort_shoot_when_ball_moved: true  
       limit_speed_near_border: false 
       near_border_speed_limit: 0.5
       near_border_dist_threshold: -1.0 
-      enable_bypass: false 
-      enable_shoot: false 
-      enable_directional_kick: false 
       use_squat_block: true 
       squat_block_msecs: 2000.0 
       use_move_block: false 
       move_block_msecs: 2000.0 
-      shoot:
-        threat_threshold: -2.0 
-        xmin: 0.3
-        xmax: 0.6
-        ymin: -0.3
-        ymax: 0.3
-
-      power_shoot:
-        enable: false 
-        use_for_kickoff: false 
-        xmin: 1.1 
-        xmax: 1.5 
-        ymin: -0.3 
-        ymax: 0.3 
       enable_auto_visual_kick: true
       auto_visual_kick_enable_dist_min: 0.2
       auto_visual_kick_enable_dist_max: 4.0
@@ -156,8 +138,8 @@ brain_node:
     RLVisionKick:
       visual_kick_version: kV2 # kV1 | kV2 修改此参数可更改visualkick调用版本
       # /kick_ball 消息的 power 字段 (期望踢行距离, m) 计算方式:
-      # distance: power = clamp(球到对方球门距离 + power_overshoot, power_min, power_max), 全场(含中场)都给大脚
-      # legacy:   球距门 <= legacy_full_power_dist 时给 power_max, 否则 power_min (旧行为: 只在对方半场纵深开大脚)
+      # distance: power = clamp(球到选中射门目标的距离 + power_overshoot, power_min, power_max)
+      # legacy:   球距选中目标 <= legacy_full_power_dist 时给 power_max, 否则 power_min
       power_mode: distance
       power_min: 2.0
       power_max: 6.0 # RL 策略已实测过的力度上限; 想中场直接吊门可实测确认策略支持后调大

@@ -40,6 +40,7 @@ struct World {
     bool ownerControlling = false;
     bool goalObserved = false;
     bool viewReliable = false;
+    std::array<Point, 4> viewFootprint{}; // Fresh camera ground quadrilateral, field coordinates.
     std::array<Obstacle, kMaxObstacles> obstacles{};
     std::size_t obstacleCount = 0;
 };

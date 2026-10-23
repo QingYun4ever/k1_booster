@@ -6,7 +6,6 @@
       <ReactiveSequence>
          <ReactiveSequence _while="gc_is_sub_state_kickoff_side" name="移动到开点球位置">
             <CamTrackBall _while="ball_location_known" />
-            <CalcKickDir />
             <SubTree ID="FindBall" _while="!(ball_location_known || tm_ball_pos_reliable)" _autoremap="true" />
             <ReactiveFallback _while="formation_enable &amp;&amp; (ball_location_known || tm_ball_pos_reliable)">
                <GoToFormationSlot scene="freekick_attack" vx_limit="0.7" vy_limit="0.4" />
@@ -16,7 +15,6 @@
          </ReactiveSequence>
          <ReactiveSequence _while="!gc_is_sub_state_kickoff_side" name="移动到防守点球位置">
             <CamTrackBall _while="ball_location_known" />
-            <CalcKickDir />
             <SubTree ID="FindBall" _while="!(ball_location_known || tm_ball_pos_reliable)" _autoremap="true" />
             <ReactiveFallback _while="formation_enable &amp;&amp; (ball_location_known || tm_ball_pos_reliable)">
                <GoToFormationSlot scene="freekick_defense" />

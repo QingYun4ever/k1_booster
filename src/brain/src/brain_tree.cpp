@@ -37,7 +37,6 @@ void BrainTree::init()
     REGISTER_BUILDER(Adjust)
     REGISTER_BUILDER(Kick)
     REGISTER_BUILDER(StandStill)
-    REGISTER_BUILDER(CalcKickDir)
     REGISTER_BUILDER(StrikerDecide)
     REGISTER_BUILDER(CamTrackBall)
     REGISTER_BUILDER(CamFindBall)
@@ -797,6 +796,10 @@ NodeStatus Assist::tick()
 
 NodeStatus Adjust::tick()
 {
+    if (!brain->data->tacticalKick.valid) {
+        brain->client->stopMotion();
+        return NodeStatus::SUCCESS;
+    }
     if (!brain->tree->getEntry<bool>("ball_location_known"))
     {
         return NodeStatus::SUCCESS;
@@ -816,13 +819,9 @@ NodeStatus Adjust::tick()
     getInput("no_turn_threshold", noTurnThreshold);
     turnFirstThreshold = turnThreshold;
     getInput("turn_first_threshold", turnFirstThreshold);
-    string position;
-    getInput("position", position);
 
     double vx = 0, vy = 0, vtheta = 0;
-    double kickDir = (position == "defense") ?
-        atan2(brain->data->ball.posToField.y, brain->data->ball.posToField.x + brain->config->fieldDimensions.length / 2)
-        : brain->data->kickDir;
+    double kickDir = brain->data->kickDir;
     double dir_rb_f = brain->data->robotBallAngleToField;
     double deltaDir = toPInPI(kickDir - dir_rb_f);
     double ballRange = brain->data->ball.range;
@@ -858,283 +857,55 @@ NodeStatus Adjust::tick()
     return NodeStatus::SUCCESS;
 }
 
-NodeStatus CalcKickDir::tick()
+
+NodeStatus StrikerDecide::tick()
 {
-    // 读取和处理参数
-    double crossThreshold;
-    getInput("cross_threshold", crossThreshold);
-
-    string lastKickType = brain->data->kickType;
-    if (lastKickType == "cross") crossThreshold += 0.1; //防止震荡
-
-    auto gpAngles = brain->getGoalPostAngles(0.0);
-    auto thetal = gpAngles[0]; auto thetar = gpAngles[1];
-    auto bPos = brain->data->ball.posToField;
-    auto fd = brain->config->fieldDimensions;
-    auto color = 0xFFFFFFFF; // for log
-
-    // (方案任务4+1) 开球 guard 期间, 本机是站位框架分配的开球者: 第一脚固定为小传球, 指向框架给出的接应点.
-    // 保证开球第一脚是"触球传递"而非射门 (规则: 开球第一脚射门不算进球).
-    bool formationEnable = false;
-    brain->get_parameter("strategy.formation.enable", formationEnable);
-    if (formationEnable
-        && brain->data->kickoffGuardActive
-        && brain->data->formationPassTargetValid
-        && (brain->data->formationSlotName == "passer" || brain->data->formationSlotName == "kicker")) {
-        brain->data->kickType = "pass";
-        brain->data->kickDir = atan2(brain->data->formationPassTarget.y - bPos.y,
-                                     brain->data->formationPassTarget.x - bPos.x);
-        brain->log->setTimeNow();
-        brain->log->log(
-            "field/kick_dir",
-            rerun::Arrows2D::from_vectors({{10 * cos(brain->data->kickDir), -10 * sin(brain->data->kickDir)}})
-                .with_origins({{brain->data->ball.posToField.x, -brain->data->ball.posToField.y}})
-                .with_colors({0x00FFFFFF})
-                .with_radii(0.01)
-                .with_draw_order(31)
-        );
-        return NodeStatus::SUCCESS;
-    }
-
-    if (thetal - thetar < crossThreshold && brain->data->ball.posToField.x > fd.circleRadius) {
-        brain->data->kickType = "cross";
-        color = 0xFF00FFFF;
-        brain->data->kickDir = atan2(
-            - bPos.y,
-            fd.length/2 - fd.penaltyDist/2 - bPos.x
-        );
-    }
-    else if (
-        brain->data->isFreekickKickingOff 
-        && brain->isPrimaryStriker() 
-        && !brain->data->isDirectShoot
-        && (bPos.x < fd.length/2.0 - fd.goalAreaWidth && bPos.x > -fd.length/2.0 + fd.penaltyAreaWidth)
-    ) {
-        // 在开球时, 决策要不要传中
-        brain->data->kickType = "cross";
-        color = 0xFF00FFFF;
-        auto ballPos = brain->data->ball.posToField;
-        auto fd = brain->config->fieldDimensions;
-        if (ballPos.y > fd.width / 2.0  * 0.8) brain->data->kickDir = - M_PI / 2.0;
-        if (ballPos.y < -fd.width / 2.0  * 0.8) brain->data->kickDir =  M_PI / 2.0;
-    }
-    else if (brain->isDefensing()) {
-        brain->data->kickType = "block";
-        color = 0xFFFF00FF;
-        brain->data->kickDir = atan2(
-            bPos.y,
-            bPos.x + fd.length/2
-        );
-
-    } else { // default to shoot
-        brain->data->kickType = "shoot";
-        color = 0x00FF00FF;
-        brain->data->kickDir = atan2(
-            - bPos.y,
-            fd.length/2 - bPos.x
-        );
-        if (brain->data->ball.posToField.x > brain->config->fieldDimensions.length / 2) brain->data->kickDir = 0; // 已经过线了, 继续向前踢
-    }
-
-    brain->log->setTimeNow();
-    brain->log->log(
-        "field/kick_dir",
-        rerun::Arrows2D::from_vectors({{10 * cos(brain->data->kickDir), -10 * sin(brain->data->kickDir)}})
-            .with_origins({{brain->data->ball.posToField.x, -brain->data->ball.posToField.y}})
-            .with_colors({color})
-            .with_radii(0.01)
-            .with_draw_order(31)
-    );
-
-    return NodeStatus::SUCCESS;
-}
-
-NodeStatus StrikerDecide::tick() {
-    auto log = [=](string msg) {
-        brain->log->setTimeNow();
-        brain->log->log("debug/striker_decide", rerun::TextLog(msg));
-    };
-    // 读取和处理参数
-    bool enableBypass, enableShoot, enableDirectionalKick, kickAOUseShoot, enablePowerShoot, usePowerShootForKickoff;
-    brain->get_parameter("strategy.power_shoot.enable", enablePowerShoot);
-    brain->get_parameter("strategy.power_shoot.use_for_kickoff", usePowerShootForKickoff);
-    brain->get_parameter("strategy.enable_shoot", enableShoot);
-    brain->get_parameter("strategy.enable_bypass", enableBypass);
-    brain->get_parameter("strategy.enable_directional_kick", enableDirectionalKick);
-    brain->get_parameter("obstacle_avoidance.kick_ao_use_shoot", kickAOUseShoot);
-    double KICK_RANGE = 1.0;
-    brain->get_parameter("strategy.kick_range", KICK_RANGE);
-    double KICK_THETA_RANGE = 1.5;
-    brain->get_parameter("strategy.kick_theta_range", KICK_THETA_RANGE);
-
-    const double bypassThreshold = 0.5;
-    double chaseRangeThreshold;
-    getInput("chase_threshold", chaseRangeThreshold);
-    string lastDecision, position;
-    getInput("decision_in", lastDecision);
-    getInput("position", position);
-
-    bool enableAutoVisualKick = false;
-    brain->get_parameter("strategy.enable_auto_visual_kick", enableAutoVisualKick);
-    double autoVisualKickEnableDistMin = 0.2;
-    double autoVisualKickEnableDistMax = 4.0;
-    double autoVisualKickEnableAngle = 0.8;
-    brain->get_parameter("strategy.auto_visual_kick_enable_dist_min", autoVisualKickEnableDistMin);
-    brain->get_parameter("strategy.auto_visual_kick_enable_dist_max", autoVisualKickEnableDistMax);
-    brain->get_parameter("strategy.auto_visual_kick_enable_angle", autoVisualKickEnableAngle);
-
-    double kickDir = brain->data->kickDir;
-    double dir_rb_f = brain->data->robotBallAngleToField; // 机器人到球, field 坐标系中的方向
-    const auto localBall = brain->data->ball;
-    const auto ball = brain->getBallForChase();
-    double ballRange = ball.range;
-    double ballYaw = ball.yawToRobot;
-    double ballX = ball.posToRobot.x;
-    double ballY = ball.posToRobot.y;
-
-
-    const double goalpostMargin = 0.3; // 计算角度时为门柱让出的距离
-    bool angleGoodForKick = brain->isAngleGood(goalpostMargin, "kick");
-    bool angleGoodForShoot = brain->isAngleGood(goalpostMargin, "shoot");
-    bool angleGoodForDirectionalKick = brain->isAngleGoodForDirectionalKick(goalpostMargin);
-
-    const double SHOOT_Y_RANGE = 0.3;
-    const double SHOOT_X_MAX = 0.6;
-    const double SHOOT_X_MIN = 0.2;
-    const double STRONG_SHOOT_X_MIN = 1.0;
-    bool shootPossible = angleGoodForShoot && fabs(ballY) < SHOOT_Y_RANGE && ballX < SHOOT_X_MAX && ballX > SHOOT_X_MIN;
-    bool directionalKickPossible = angleGoodForDirectionalKick && fabs(ballY) < SHOOT_Y_RANGE && ballX < SHOOT_X_MAX && ballX > SHOOT_X_MIN;
-    bool useStrongShoot = shootPossible && fabs(ballX) > STRONG_SHOOT_X_MIN; // TODO now impossible to be true
-
-
-    bool avoidPushing;
-    double kickAoSafeDist;
-    brain->get_parameter("obstacle_avoidance.avoid_during_kick", avoidPushing);
-    brain->get_parameter("obstacle_avoidance.kick_ao_safe_dist", kickAoSafeDist);
-    bool avoidKick = avoidPushing // 是否在踢球时避免碰撞
-        && brain->data->robotPoseToField.x < brain->config->fieldDimensions.length / 2 - brain->config->fieldDimensions.goalAreaLength
-        && brain->distToObstacle(brain->data->ball.yawToRobot) < kickAoSafeDist;
-
-    log(format("ballRange: %.2f, ballYaw: %.2f, ballX:%.2f, ballY: %.2f kickDir: %.2f, dir_rb_f: %.2f, angleGoodForKick: %d, angleGoodForShoot: %d, shootPossible: %d, strongShoot: %d",
-        ballRange, ballYaw, ballX, ballY, kickDir, dir_rb_f, angleGoodForKick, angleGoodForShoot, shootPossible, useStrongShoot));
-
-    // 判断是否穿过了 KickDir
-    double deltaDir = toPInPI(kickDir - dir_rb_f);
-    auto now = brain->get_clock()->now();
-    auto dt = brain->msecsSince(timeLastTick);
-    bool reachedKickDir = 
-        deltaDir * lastDeltaDir <= 0 
-        && fabs(deltaDir) < M_PI / 6
-        && dt < 100;
-    reachedKickDir = reachedKickDir || fabs(deltaDir) < 0.1;
-    timeLastTick = now;
-    lastDeltaDir = deltaDir;
-
-    double kickValue = brain->kickValue(dir_rb_f);
-    double threatLevel = brain->threatLevel();
-    log(format("kickValue: %.1f, threatLevel: %.1f", kickValue, threatLevel));
-     
-
-    string newDecision;
-    auto color = 0xFFFFFFFF; // for log
-    bool iKnowBallPos = brain->tree->getEntry<bool>("ball_location_known");
-    bool tmBallPosReliable = brain->tree->getEntry<bool>("tm_ball_pos_reliable");
-    if (!(iKnowBallPos || tmBallPosReliable))
-    {
-        newDecision = "find";
-        color = 0xFFFFFFFF;
-    } else if (
-        enableAutoVisualKick &&
-        brain->isKickAllowed() &&
-        brain->hasFreshLocalBall() &&
-        !brain->data->kickoffGuardActive && // (方案任务1) 开球后第一脚触球前, 禁用 vision kick
-        brain->data->tmImLead &&
-        brain->data->tmMyCostRank == 0 &&
-        !brain->tree->getEntry<bool>("ball_out") &&
-        !brain->data->lose_ball &&
-        brain->data->tmMyCost < 7.0 &&
-        localBall.range < autoVisualKickEnableDistMax &&
-        localBall.range > autoVisualKickEnableDistMin &&
-        fabs(localBall.yawToRobot) < autoVisualKickEnableAngle * 1.3 &&
-        localBall.posToField.x > brain->config->fieldDimensions.length / 2 - 14.3 &&
-        fabs(localBall.posToField.y) < 5.0 &&
-        brain->data->robotPoseToField.x > brain->config->fieldDimensions.length / 2 - 14.3 &&
-        fabs(brain->data->robotPoseToField.y) < 5.0
-    ) {
-        newDecision = "auto_visual_kick";
-        color = 0xFF00FFFF;
-    } else if (!brain->data->tmImLead) {
-        newDecision = "assist";
-        color = 0x00FFFFFF;
-    }
-    else if (!brain->hasFreshLocalBall()) {
-        newDecision = "chase";
-        color = 0x0000FFFF;
-    }
-    else if (ballRange > chaseRangeThreshold * (lastDecision == "chase" ? 0.9 : 1.0))
-    {
-        newDecision = "chase";
-        color = 0x0000FFFF;
-    } 
-    else if (
-        brain->isKickAllowed() &&
-        brain->hasFreshLocalBall() &&
-        (
-            (angleGoodForKick && !brain->data->isFreekickKickingOff)
-            || reachedKickDir
-        )
-        && !avoidKick
-        && brain->data->ballDetected
-        && fabs(localBall.yawToRobot) < KICK_THETA_RANGE
-        && localBall.range < KICK_RANGE
-    )
-    {
-        if (brain->data->kickType == "cross" || brain->data->kickType == "pass") newDecision = "cross"; // pass(开球小传)复用 cross 的低速趟球动作
-        else newDecision = "kick";
-        color = 0x00FF00FF;
-        brain->data->isFreekickKickingOff = false; // 只要进一次 kick, 就不算是 kickoff 阶段了.
-    }
-    else
-    {
-        newDecision = "adjust";
-        color = 0xFFFF00FF;
-    }
-
-    // 防卡死(借鉴八一队 demo): adjust(绕球对位)连续超过 adjust_timeout_secs 则强制退回 chase,
-    // 打破"原地绕球不前进"的死锁。默认 0.0 = 关闭, 行为完全不变。
-    double adjustTimeoutSecs = 0.0;
-    brain->get_parameter("strategy.adjust_timeout_secs", adjustTimeoutSecs);
-    if (adjustTimeoutSecs > 0.0 && newDecision == "adjust") {
-        if (!_adjustActive) {
-            _adjustActive = true;
-            _adjustSince = now;
-        } else if ((now - _adjustSince).seconds() > adjustTimeoutSecs) {
-            newDecision = "chase";   // 超时退回追球, 重新接近后再尝试对位
-            _adjustActive = false;   // 重置计时, 下次进 adjust 重新计
-            log("adjust timeout -> chase (anti-deadlock)");
-        }
+    string previous;
+    getInput("decision_in", previous);
+    const auto now = brain->get_clock()->now();
+    const auto ball = brain->hasFreshLocalBall() ? brain->data->ball : brain->getBallForChase();
+    const auto &pose = brain->data->robotPoseToField;
+    tactics::DecisionInput input;
+    input.plan = brain->data->tacticalKick;
+    input.robot = {pose.x, pose.y, pose.theta};
+    input.ball = {ball.posToField.x, ball.posToField.y};
+    input.range = ball.range;
+    input.yaw = ball.yawToRobot;
+    input.chaseThreshold = getInput<double>("chase_threshold").value();
+    input.kickRange = brain->get_parameter("strategy.kick_range").as_double();
+    input.kickYaw = brain->get_parameter("strategy.kick_theta_range").as_double();
+    input.visualMinRange = brain->get_parameter("strategy.auto_visual_kick_enable_dist_min").as_double();
+    input.visualMaxRange = brain->get_parameter("strategy.auto_visual_kick_enable_dist_max").as_double();
+    input.visualYaw = brain->get_parameter("strategy.auto_visual_kick_enable_angle").as_double();
+    input.configuredAdjustTimeout = brain->get_parameter("strategy.adjust_timeout_secs").as_double();
+    input.adjustSeconds = _adjustActive ? brain->msecsSince(_adjustSince) / 1000.0 : 0.0;
+    input.motionAllowed = brain->isMotionAllowed();
+    input.kickAllowed = brain->isKickAllowed();
+    input.ballKnown = brain->tree->getEntry<bool>("ball_location_known") || brain->tree->getEntry<bool>("tm_ball_pos_reliable");
+    input.localFresh = brain->hasFreshLocalBall();
+    input.lead = brain->data->tmImLead;
+    input.kickoffGuard = brain->data->kickoffGuardActive;
+    input.enableVisual = brain->get_parameter("strategy.enable_auto_visual_kick").as_bool();
+    input.wasChasing = previous == "chase";
+    const auto decision = tactics::chooseDecision(input);
+    if (decision == tactics::Decision::Adjust) {
+        if (!_adjustActive) _adjustSince = now;
+        _adjustActive = true;
     } else {
         _adjustActive = false;
     }
-
-    if (newDecision != "auto_visual_kick") {
+    if (brain->data->tmImInVisualKick && decision != tactics::Decision::VisualKick) {
+        if (brain->client->stopMotion() != 0) {
+            setOutput("decision_out", string("auto_visual_kick"));
+            return NodeStatus::SUCCESS;
+        }
         brain->data->tmImInVisualKick = false;
     }
-
-    setOutput("decision_out", newDecision);
-    brain->log->logToScreen(
-        "tree/Decide",
-        format(
-            "Decision: %s ballrange: %.2f ballyaw: %.2f kickDir: %.2f rbDir: %.2f angleGoodForKick: %d angleGoodForShoot: %d lead: %d", 
-            newDecision.c_str(), ballRange, ballYaw, kickDir, dir_rb_f, angleGoodForKick, angleGoodForShoot, brain->data->tmImLead
-        ),
-        color
-    );
-
-    color = 0xFFFFFFFF;
-    if (threatLevel >= 2.0) color = 0xFF0000FF;
-    else if (threatLevel >= 1.0) color = 0xFFCC00FF;
-    brain->log->logToScreen("tree/value_threat", format("Threat Level: %.1f, Kick Value: %.1f", threatLevel, kickValue), color, 60);
+    setOutput("decision_out", string(tactics::decisionName(decision)));
+    brain->log->logToScreen("tree/Decide",
+        format("Decision: %s target=(%.2f,%.2f) window=%.2f pressure=%.2fs owner=%d",
+            tactics::decisionName(decision), input.plan.target.x, input.plan.target.y,
+            input.plan.windowRadians, input.plan.opponentArrivalSeconds, brain->data->ballOwnerId), 0xFFFFFFFF);
     return NodeStatus::SUCCESS;
 }
 
@@ -1143,7 +914,7 @@ NodeStatus GoalieDecide::tick()
     // 读取和处理参数
     double chaseRangeThreshold;
     getInput("chase_threshold", chaseRangeThreshold);
-    string lastDecision, position;
+    string lastDecision;
     getInput("decision_in", lastDecision);
     const auto chaseBall = brain->getBallForChase();
     const auto fd = brain->config->fieldDimensions;
@@ -1151,12 +922,9 @@ NodeStatus GoalieDecide::tick()
     const bool nearOwnBox = chaseBall.posToField.x <= ownGoalX + fd.penaltyAreaLength + 1.0
         && fabs(chaseBall.posToField.y) <= fd.penaltyAreaWidth / 2.0 + 1.0;
 
-    double kickDir = atan2(chaseBall.posToField.y, chaseBall.posToField.x + brain->config->fieldDimensions.length / 2);
-    double dir_rb_f = brain->data->robotBallAngleToField; // 机器人到球, field 坐标系中的方向
-    auto goalPostAngles = brain->getGoalPostAngles(0.3);
-    double theta_l = goalPostAngles[0]; // 球到左边门柱的角度(我们的左)
-    double theta_r = goalPostAngles[1]; // 球到右边门柱的角度
-    bool angleIsGood = (dir_rb_f > -M_PI / 2 && dir_rb_f < M_PI / 2);
+    const double kickDir = brain->data->kickDir;
+    const double dir_rb_f = brain->data->robotBallAngleToField;
+    const bool angleIsGood = brain->isGroundKickAllowed();
     double ballRange = chaseBall.range;
     double ballYaw = chaseBall.yawToRobot;
 
@@ -1179,7 +947,11 @@ NodeStatus GoalieDecide::tick()
         newDecision = "retreat";
         color = 0xFF00FFFF;
     }
-    else if (ballRange > chaseRangeThreshold * (lastDecision == "chase" ? 0.9 : 1.0))
+    else if (!brain->data->tacticalKick.valid && brain->hasFreshLocalBall())
+    {
+        newDecision = "retreat";
+    }
+    else if (!brain->hasFreshLocalBall() || ballRange > chaseRangeThreshold * (lastDecision == "chase" ? 0.9 : 1.0))
     {
         newDecision = "chase";
         color = 0x00FF00FF;
@@ -1202,49 +974,10 @@ NodeStatus GoalieDecide::tick()
     return NodeStatus::SUCCESS;
 }
 
-tuple<double, double, double> Kick::_calcSpeed() {
-    double vx, vy, msecKick;
-
-    // 读取参数
-    double vxLimit, vyLimit;
-    getInput("vx_limit", vxLimit);
-    getInput("vy_limit", vyLimit);
-    int minMSecKick;
-    getInput("min_msec_kick", minMSecKick);
-    double vxFactor = brain->config->vxFactor;   // 用于调整 vx, vx *= vxFactor, 以补偿 x, y 方向的速度参数与实际速度比例的偏差, 使运动方向准确
-    double yawOffset = brain->config->yawOffset; // 用于补偿定位角度的偏差
-
-    // 计算速度指令
-    double adjustedYaw = brain->data->ball.yawToRobot + yawOffset;
-    double tx = cos(adjustedYaw) * brain->data->ball.range; // 移动的目标
-    double ty = sin(adjustedYaw) * brain->data->ball.range;
-
-    if (fabs(ty) < 0.01 && fabs(adjustedYaw) < 0.01)
-    { // 在可踢中的范围内, 尽量直走, 同时避免后面出现除 0 的问题.
-        vx = vxLimit;
-        vy = 0.0;
-    }
-    else
-    { // 否则计算出要向哪个方向移动, 并给出可实现的速度指令
-        vy = ty > 0 ? vyLimit : -vyLimit;
-        vx = vy / ty * tx * vxFactor;
-        if (fabs(vx) > vxLimit)
-        {
-            vy *= vxLimit / vx;
-            vx = vxLimit;
-        }
-    }
-
-    // 估算移动所需时间
-    double speed = norm(vx, vy);
-    msecKick = speed > 1e-5 ? minMSecKick + static_cast<int>(brain->data->ball.range / speed * 1000) : minMSecKick;
-     
-    return make_tuple(vx, vy, msecKick);
-}
 
 NodeStatus Kick::onStart()
 {
-    if (!brain->isMotionAllowed() || !brain->isKickAllowed() || !brain->hasFreshLocalBall()) {
+    if (!brain->isGroundKickAllowed()) {
         brain->client->setVelocity(0.0, 0.0, 0.0, false, false, false);
         return NodeStatus::SUCCESS;
     }
@@ -1267,12 +1000,14 @@ NodeStatus Kick::onStart()
 
     // 初始化 Node
     _startTime = brain->get_clock()->now();
-    if (brain->config->enableStableKick && brain->threatLevel() < 0.5) _state = "stablize"; // false  开启后, 在 kick 时, 如风险较低, 则稳定一下再出脚.
+    const double stableSeconds = getInput<double>("msecs_stablize").value() / 1000.0;
+    if (brain->config->enableStableKick && brain->data->tacticalKick.action == tactics::Action::Shoot &&
+        brain->data->tacticalKick.opponentArrivalSeconds > stableSeconds + 0.35) _state = "stablize";
     else _state = "kick";
      
     // 发布运动指令
     if (_state == "kick") {
-        double angle = brain->data->ball.yawToRobot;
+        double angle = toPInPI(brain->data->kickDir - brain->data->robotPoseToField.theta);
         double speed = getInput<double>("speed_limit").value();
         bool softKickoff;
         double softKickoffSpeed;
@@ -1292,7 +1027,7 @@ NodeStatus Kick::onStart()
 
 NodeStatus Kick::onRunning()
 {
-    if (!brain->isMotionAllowed() || !brain->isKickAllowed() || !brain->hasFreshLocalBall()) {
+    if (!brain->isGroundKickAllowed()) {
         brain->client->stopMotion();
         return NodeStatus::SUCCESS;
     }
@@ -1321,6 +1056,7 @@ NodeStatus Kick::onRunning()
         )
     ) {
         log("ball moved, abort kick");
+        brain->client->stopMotion();
         return NodeStatus::SUCCESS;
     }
     log(format("ballrange: %.1f, minRange: %.1f", ballRange, _minRange));
@@ -1341,10 +1077,11 @@ NodeStatus Kick::onRunning()
 
     if (_state == "stablize") {
         double msecs = getInput<double>("msecs_stablize").value();
-        if (brain->msecsSince(_startTime) > msecs) {
+        if (brain->msecsSince(_startTime) > msecs ||
+            brain->data->tacticalKick.opponentArrivalSeconds <= 0.35) {
             _state = "kick";
             _startTime = brain->get_clock()->now();
-            double angle = brain->data->ball.yawToRobot;
+            double angle = toPInPI(brain->data->kickDir - brain->data->robotPoseToField.theta);
             double speed = getInput<double>("speed_limit").value();
             bool softKickoff;
             double softKickoffSpeed;
@@ -1368,7 +1105,7 @@ NodeStatus Kick::onRunning()
         }
         // else
         if (brain->data->ballDetected) { // 如果还能看见球, 则修正方向
-            double angle = brain->data->ball.yawToRobot;
+            double angle = toPInPI(brain->data->kickDir - brain->data->robotPoseToField.theta);
             double speed = getInput<double>("speed_limit").value();
             if (brain->get_parameter("strategy.soft_kickoff").as_bool() &&
                 (brain->data->kickoffGuardActive || brain->data->isFreekickKickingOff || brain->data->isKickingOff)) {
@@ -1400,12 +1137,13 @@ NodeStatus RLVisionKick::onStart()
     _visionKickStarted = false;
     _isDecelerating = false;
     _pendingRobocupWalk = false;
-    if (!brain->isMotionAllowed() || !brain->isKickAllowed()
+    if (!brain->isMotionAllowed() || !brain->isVisualKickAllowed()
         || !brain->hasFreshLocalBall() || brain->data->kickoffGuardActive) {
         brain->data->tmImInVisualKick = false;
         return NodeStatus::SUCCESS;
     }
 
+    brain->data->tmImInVisualKick = true; // Reserve ownership throughout deceleration and cancellation.
     _startTime = brain->get_clock()->now();
     _progress.start(
         motion_policy::ObservationStamp{brain->data->ball.timePoint.nanoseconds()},
@@ -1425,7 +1163,7 @@ NodeStatus RLVisionKick::onRunning()
     };
 
     const bool freshLocalBall = brain->hasFreshLocalBall();
-    if (motion_policy::shouldCancelVisualKick(brain->isMotionAllowed(), brain->isKickAllowed(),
+    if (motion_policy::shouldCancelVisualKick(brain->isMotionAllowed(), brain->isVisualKickAllowed(),
         freshLocalBall, brain->data->kickoffGuardActive)) {
         logExit("exit visual kick: motion/kick gate closed");
         if (brain->client->stopMotion() != 0) return NodeStatus::RUNNING;
@@ -3661,7 +3399,7 @@ NodeStatus GoToFormationSlot::tick()
         _frozenBall = in.ballPos;
         _lastReplanTime = brain->get_clock()->now();
 
-        // 透出槽位与传球目标 (开球者的 CalcKickDir 在 kickoff_guard 期间消费)
+        // 透出槽位与传球目标 (updateKickPlan 在下一帧 kickoff_guard 期间消费)
         brain->data->formationSlotName = _current.valid ? _current.slotName : "";
         brain->data->formationPassTargetValid = _current.valid && _current.passTargetValid;
         if (brain->data->formationPassTargetValid) {

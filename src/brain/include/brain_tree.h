@@ -13,6 +13,8 @@
 #include "formation.h"
 #include "motion_policy.h"
 #include "tactical_support.h"
+#include "tactical_kick.h"
+#include "tactical_decision.h"
 
 class Brain;
 
@@ -54,16 +56,6 @@ private:
 // ------------------------------- 比赛用 -------------------------------
 
 
-// 计算踢球的角度
-class CalcKickDir : public SyncActionNode 
-{
-public:
-    CalcKickDir(const string &name, const NodeConfig &config, Brain *_brain) : SyncActionNode(name, config), brain(_brain) {}
-    static PortsList providedPorts() { return { InputPort<double>("cross_threshold", 0.2, "可进门的角度范围") }; }
-    NodeStatus tick() override;
-private:
-    Brain *brain;
-};
 
 class StrikerDecide : public SyncActionNode
 {
@@ -73,14 +65,11 @@ public:
         return {
             InputPort<double>("chase_threshold", 1.0, "超过这个距离, 执行追球动作"),
             InputPort<string>("decision_in", "", "用于读取上一次的 decision"),
-            InputPort<string>("position", "offense", "offense | defense"),
             OutputPort<string>("decision_out")};
     }
     NodeStatus tick() override;
 private:
     Brain *brain;
-    double lastDeltaDir;
-    rclcpp::Time timeLastTick;
     rclcpp::Time _adjustSince;      // adjust 连续开始的时刻 (防卡死计时)
     bool _adjustActive = false;     // 当前是否处于连续 adjust 计时中
 };
@@ -290,8 +279,7 @@ public:
             InputPort<double>("near_threshold", 0.8, ""),
             InputPort<double>("no_turn_threshold", 0.1, ""),
             InputPort<double>("turn_first_threshold", 0.5, ""),
-            InputPort<double>("min_range", 1.0, ""),
-            InputPort<string>("position", "offense", "")};
+            InputPort<double>("min_range", 1.0, "")};
     }
     NodeStatus tick() override;
 private:
@@ -326,7 +314,6 @@ private:
     int _msecKick = 1000;
     double _speed;
     double _minRange;
-    tuple<double, double, double> _calcSpeed();
 };
 
 class Shoot : public StatefulActionNode

@@ -31,8 +31,8 @@
                   <SetVelocity />
                   <!-- <StepOnSpot /> -->
                </ReactiveSequence>
-               <Sequence _while="!wait_for_opponent_kickoff" name="正常比赛">
-                  <Sequence>  <!-- 守门员只有 attack 模式; guard 分支已删除 -->
+               <ReactiveSequence _while="!wait_for_opponent_kickoff" name="正常比赛">
+                  <ReactiveSequence>
                      <!-- <CamTrackBall /> -->
                      <SubTree ID="CamFindAndTrackBall" _autoremap="true" />
                      <GoalieDecide decision_out="{decision}" decision_in="{decision}" chase_threshold="1.0" />
@@ -49,9 +49,9 @@
                         <Kick speed_limit="1.2" min_msec_kick="600"/>
                      </Sequence>
                      <!-- RLVisionKick node removed in open-source version -->
-                  </Sequence>
+                  </ReactiveSequence>
 
-               </Sequence>
+               </ReactiveSequence>
             </ReactiveSequence>
          </ReactiveSequence>
       </ReactiveSequence>

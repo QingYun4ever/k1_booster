@@ -264,9 +264,6 @@ Brain::Brain() : rclcpp::Node("brain_node")
     declare_parameter<double>("strategy.ball_confidence_decay_rate", 3.0);
     declare_parameter<bool>("strategy.enable_stable_kick", false);
     declare_parameter<bool>("strategy.abort_kick_when_ball_moved", false);
-    declare_parameter<bool>("strategy.enable_bypass", false);
-    declare_parameter<bool>("strategy.enable_shoot", false);
-    declare_parameter<bool>("strategy.enable_directional_kick", false);
     declare_parameter<double>("strategy.adjust_timeout_secs", 0.0);
 
     declare_parameter<bool>("ball_prediction.enable", false);
@@ -305,22 +302,7 @@ Brain::Brain() : rclcpp::Node("brain_node")
     declare_parameter<double>("strategy.auto_visual_kick_enable_dist_min", 0.2);
     declare_parameter<double>("strategy.auto_visual_kick_enable_dist_max", 4.0);
     declare_parameter<double>("strategy.auto_visual_kick_enable_angle", 0.8);
-    declare_parameter<bool>("strategy.enable_rlvk_chase", false);
-    declare_parameter<double>("strategy.rlvk_chase_enable_dist_min", 1.0);
-    declare_parameter<double>("strategy.rlvk_chase_enable_dist_max", 6.0);
-    declare_parameter<double>("strategy.rlvk_chase_enable_angle", 0.8);
 
-    declare_parameter<bool>("strategy.power_shoot.enable", false);
-    declare_parameter<bool>("strategy.power_shoot.use_for_kickoff", false);
-    declare_parameter<double>("strategy.power_shoot.xmin", 0.5);
-    declare_parameter<double>("strategy.power_shoot.xmax", 1.0);
-    declare_parameter<double>("strategy.power_shoot.ymin", -0.5);
-    declare_parameter<double>("strategy.power_shoot.ymax", 0.5);
-    declare_parameter<double>("strategy.shoot.threat_threshold", 0.0);
-    declare_parameter<double>("strategy.shoot.xmin", 0.5);
-    declare_parameter<double>("strategy.shoot.xmax", 1.0);
-    declare_parameter<double>("strategy.shoot.ymin", -0.5);
-    declare_parameter<double>("strategy.shoot.ymax", 0.5);
     declare_parameter<double>("strategy.cooperation.owner_switch_margin", 0.3);
     declare_parameter<bool>("strategy.role_assignment.gk_takeover", true);
 
@@ -685,13 +667,19 @@ void Brain::tick()
     handleCooperation();
     if (!isMotionAllowed()) {
         tree->halt();
-        client->stopMotion();
-        data->tmImInVisualKick = false;
+        // A failed cancel retains ownership until RobotClient accepts the stop.
+        if (client->stopMotion() == 0) data->tmImInVisualKick = false;
     }
     // SET still permits non-motion localization; RobotClient gates every output.
     data->supportTargetValid = false;
     data->supportRole = "hold";
-    tree->tick();
+    updateKickPlan();
+    bool cancelPending = false;
+    if (data->tmImInVisualKick && !isVisualKickAllowed()) {
+        cancelPending = client->stopMotion() != 0;
+        if (!cancelPending) data->tmImInVisualKick = false;
+    }
+    if (!cancelPending) tree->tick();
     pubKickMsg();
     communication->update();
     logDebugInfo();
@@ -744,6 +732,24 @@ bool Brain::isKickAllowed() const
     const double age = data->gcReceived ? (now - data->timeLastGamecontrolMsg).nanoseconds() / 1e6 : 0.0;
     return match_policy::canKick(matchState_, data->gcReceived, age,
         config->gameControllerTimeoutMs, false);
+}
+
+bool Brain::isVisualKickAllowed() const
+{
+    return isKickAllowed() && !data->kickoffGuardActive && data->tacticalKick.valid &&
+        data->tacticalKick.action == tactics::Action::Shoot && data->tacticalKick.visualKickAllowed;
+}
+
+bool Brain::isGroundKickAllowed() const
+{
+    const auto &plan = data->tacticalKick;
+    if (!isKickAllowed() || !plan.valid || plan.action == tactics::Action::Hold) return false;
+    const double range = get_parameter("strategy.kick_range").as_double();
+    const double yaw = get_parameter("strategy.kick_theta_range").as_double();
+    const auto &robot = data->robotPoseToField;
+    const double approach = atan2(data->ball.posToField.y - robot.y, data->ball.posToField.x - robot.x);
+    return data->ball.range < range && fabs(data->ball.yawToRobot) <= yaw &&
+        fabs(toPInPI(plan.direction - robot.theta)) <= yaw && fabs(toPInPI(plan.direction - approach)) <= 0.12;
 }
 
 void Brain::publishWebuiStatus() {
@@ -906,7 +912,7 @@ string Brain::buildWebuiStatusJson() {
     oss << ",\"kick_dir\":";
     appendNumber(oss, data->kickDir);
     oss << ",\"kick_type\":";
-    appendString(oss, data->kickType);
+    appendString(oss, tactics::actionName(data->tacticalKick.action));
     oss << ",\"robot_ball_angle_to_field\":";
     appendNumber(oss, data->robotBallAngleToField);
     oss << "}";
@@ -1023,8 +1029,9 @@ void Brain::pubKickMsg() {
     kickMsg.y = data->ball.posToRobot.y;
     kickMsg.dir = toPInPI(data->kickDir - data->robotPoseToField.theta);
 
-    double goal_x = config->fieldDimensions.length / 2;
-    double goal_y = 0.0;
+    if (!isVisualKickAllowed()) return;
+    double goal_x = data->tacticalKick.target.x;
+    double goal_y = data->tacticalKick.target.y;
     Pose2D goalPose;
     goalPose.x = goal_x;
     goalPose.y = goal_y;
@@ -1414,52 +1421,42 @@ void Brain::updateKickoffMemory()
     opponentRestartLatched_ = opponentRestart;
 }
 
-vector<double> Brain::getGoalPostAngles(const double margin)
+
+
+void Brain::updateKickPlan()
 {
-    double leftX, leftY, rightX, rightY; 
-
-    leftX = config->fieldDimensions.length / 2;
-    leftY = config->fieldDimensions.goalWidth / 2;
-    rightX = config->fieldDimensions.length / 2;
-    rightY = -config->fieldDimensions.goalWidth / 2;
-
-
-    auto goalposts = data->getGoalposts();
-    for (int i = 0; i < goalposts.size(); i++)
-    {
-        auto post = goalposts[i];
-        if (post.name == "OL")
-        {
-            leftX = post.posToField.x;
-            leftY = post.posToField.y;
-        }
-        else if (post.name == "OR")
-        {
-            rightX = post.posToField.x;
-            rightY = post.posToField.y;
+    const auto world = getTacticalWorld();
+    auto plan = tactics::chooseKick(world);
+    const bool formationPass = get_parameter("strategy.formation.enable").as_bool() &&
+        data->kickoffGuardActive && data->formationPassTargetValid &&
+        (data->formationSlotName == "passer" || data->formationSlotName == "kicker");
+    if (formationPass) {
+        const auto &pass = data->formationPassTarget;
+        const tactics::Point target{pass.x, pass.y};
+        const double clearance = tactics::segmentClearance(world, world.ball.position, target);
+        if (tactics::validBall(world.ball) && tactics::finite(target) &&
+            fabs(target.x) < world.field.length / 2.0 && fabs(target.y) < world.field.width / 2.0 &&
+            tactics::distance(world.ball.position, target) > 0.15 && clearance >= 0.02) {
+            plan.valid = true;
+            plan.action = tactics::Action::Carry;
+            plan.target = target;
+            plan.direction = tactics::angle(world.ball.position, target);
+            plan.clearance = std::min(clearance, 10.0);
+            plan.windowRadians = 0.0;
+            plan.opponentArrivalSeconds = tactics::kick_detail::opponentArrival(world);
+            plan.visualKickAllowed = false;
         }
     }
-
-    const double theta_l = atan2(leftY - margin - data->ball.posToField.y, leftX - data->ball.posToField.x);
-    const double theta_r = atan2(rightY + margin - data->ball.posToField.y, rightX - data->ball.posToField.x);
-
-    vector<double> vec = {theta_l, theta_r};
-    return vec;
-}
-
-double Brain::calcKickDir(double goalPostMargin) {
-    double dir_rb_f = data->robotBallAngleToField; 
-    auto goalPostAngles = getGoalPostAngles(goalPostMargin);
-    double theta_l = goalPostAngles[0]; 
-    double theta_r = goalPostAngles[1];
-    
-    if (isAngleGood(goalPostMargin)) return dir_rb_f;
-
-    double delta_l = fabs(toPInPI(theta_l - dir_rb_f));
-    double delta_r = fabs(toPInPI(theta_r - dir_rb_f));
-    if (delta_l < delta_r) return theta_l;
-    // else 
-    return theta_r;
+    if (isDefensing() || data->kickoffGuardActive) plan.visualKickAllowed = false;
+    data->tacticalKick = plan;
+    data->kickDir = plan.valid ? plan.direction : 0.0;
+    log->setTimeNow();
+    if (plan.valid) {
+        log->log("field/kick_dir",
+            rerun::Arrows2D::from_vectors({{plan.target.x - world.ball.position.x, -(plan.target.y - world.ball.position.y)}})
+                .with_origins({{world.ball.position.x, -world.ball.position.y}})
+                .with_colors(0x00FF00FF).with_radii(0.01).with_draw_order(31));
+    }
 }
 
 tactics::World Brain::getTacticalWorld() const
@@ -1470,13 +1467,20 @@ tactics::World Brain::getTacticalWorld() const
     world.limits = {std::min(config->vxLimit, 0.9), std::min(config->vyLimit, 0.2), std::min(config->vthetaLimit, 1.0)};
     const auto &pose = data->robotPoseToField;
     world.robot = {pose.x, pose.y, pose.theta};
-    const auto ball = getBallForChase();
+    const auto ball = hasFreshLocalBall() ? data->ball : getBallForChase();
     world.ball.position = {ball.posToField.x, ball.posToField.y};
     world.ball.ageSeconds = msecsSince(ball.timePoint) / 1000.0;
     world.ball.confidence = ball.confidence;
     world.ball.known = tree->getEntry<bool>("odom_calibrated") &&
         (tree->getEntry<bool>("ball_location_known") || tree->getEntry<bool>("tm_ball_pos_reliable"));
-    world.viewReliable = tree->getEntry<bool>("odom_calibrated") && hasFreshLocalBall();
+    const auto &view = data->visionBox;
+    const double viewAge = msecsSince(view.timePoint);
+    world.viewReliable = tree->getEntry<bool>("odom_calibrated") && hasFreshLocalBall() &&
+        viewAge >= 0.0 && viewAge <= 300.0 && view.posToField.size() >= 8;
+    if (world.viewReliable) {
+        for (std::size_t i = 0; i < world.viewFootprint.size(); ++i)
+            world.viewFootprint[i] = {view.posToField[2 * i], view.posToField[2 * i + 1]};
+    }
     const double predictionAge = msecsSince(data->ballPosPredictTime);
     world.ball.velocityKnown = data->ballPredictionValid && !data->ballPredictionPredictedOnly &&
         hasFreshLocalBall() && predictionAge >= 0.0 && predictionAge <= 300.0;
@@ -1519,24 +1523,6 @@ tactics::World Brain::getTacticalWorld() const
 }
 
 
-bool Brain::isAngleGood(double goalPostMargin, string type) {
-    double angle = 0;
-    if (type == "kick") angle = data->robotBallAngleToField; // type=="kick" 机器人到球, field 坐标系中的方向
-    if (type == "shoot") angle = data->robotPoseToField.theta; // type=="shoot" 机器人朝向
-    
-
-    auto goalPostAngles = getGoalPostAngles(goalPostMargin);
-    double theta_l = goalPostAngles[0]; 
-    double theta_r = goalPostAngles[1]; 
-    
-    if (theta_l - theta_r < M_PI / 3 * 2) { 
-        goalPostAngles = getGoalPostAngles(0.5);
-        theta_l = goalPostAngles[0]; 
-        theta_r = goalPostAngles[1]; 
-    }
-
-    return (theta_l > angle && theta_r < angle);
-}
 
 bool Brain::isPrimaryStriker() {
     return tree->getEntry<string>("player_role") == "striker" && data->tmImLead;
@@ -1672,6 +1658,7 @@ void Brain::calibrateOdom(double x, double y, double theta)
     teammateBall->reset();
     data->tmBallShareReliable = false;
     tree->setEntry<bool>("tm_ball_pos_reliable", false);
+    const auto previousPose = data->robotPoseToField;
 
     double x_or, y_or, theta_or; // or = odom to robot
     x_or = -cos(data->robotPoseToOdom.theta) * data->robotPoseToOdom.x - sin(data->robotPoseToOdom.theta) * data->robotPoseToOdom.y;
@@ -1688,6 +1675,17 @@ void Brain::calibrateOdom(double x, double y, double theta)
         data->robotPoseToOdom.x, data->robotPoseToOdom.y, data->robotPoseToOdom.theta,
         data->odomToField.x, data->odomToField.y, data->odomToField.theta,
         data->robotPoseToField.x, data->robotPoseToField.y, data->robotPoseToField.theta);
+    // Reproject the footprint without renewing its observation timestamp.
+    const auto &newPose = data->robotPoseToField;
+    const double viewCos = cos(newPose.theta - previousPose.theta);
+    const double viewSin = sin(newPose.theta - previousPose.theta);
+    auto &footprint = data->visionBox.posToField;
+    for (std::size_t i = 0; i + 1 < footprint.size(); i += 2) {
+        const double dx = footprint[i] - previousPose.x;
+        const double dy = footprint[i + 1] - previousPose.y;
+        footprint[i] = newPose.x + viewCos * dx - viewSin * dy;
+        footprint[i + 1] = newPose.y + viewSin * dx + viewCos * dy;
+    }
 
 
     double placeHolder;
@@ -1728,6 +1726,7 @@ void Brain::calibrateOdom(double x, double y, double theta)
     for (int i = 0; i < robots.size(); i++) gameObjects.push_back(robots[i]);
     for (int i = 0; i < goalposts.size(); i++) gameObjects.push_back(goalposts[i]);
     logDetection(gameObjects);
+    updateKickPlan();
 }
 
 void Brain::playSound(string soundName, double blockMsecs, bool allowRepeat)
@@ -2389,8 +2388,7 @@ void Brain::recoveryStateCallback(const booster_interface::msg::RawBytesMsg &msg
     data->currentRobotModeIndex = msg.msg[2];
     if (data->recoveryState != RobotRecoveryState::IS_READY && previous == RobotRecoveryState::IS_READY) {
         tree->halt();
-        client->stopMotion();
-        data->tmImInVisualKick = false;
+        if (client->stopMotion() == 0) data->tmImInVisualKick = false;
         data->tmImLead = false;
         data->tmImAlive = false;
     }
@@ -2843,6 +2841,12 @@ void Brain::detectProcessVisionBox(const vision_interface::msg::Detections &msg)
     // auto detection_time_stamp = msg.header.stamp;
     // rclcpp::Time timePoint(detection_time_stamp.sec, detection_time_stamp.nanosec);
     auto timePoint = timePointFromHeader(msg.header);
+    if (msg.corner_pos.size() < 10 ||
+        !std::all_of(msg.corner_pos.begin(), msg.corner_pos.end(),
+            [](double value) { return std::isfinite(value); })) {
+        data->visionBox = VisionBox{};
+        return;
+    }
 
     // 处理并记录视野信息
     VisionBox vbox;
@@ -2864,8 +2868,8 @@ void Brain::detectProcessVisionBox(const vision_interface::msg::Detections &msg)
             (i == 0 && crossProduct(v[5], v[6]) < 0)
             || (i == 1 && crossProduct(v[3], v[4]) < 0)
         ){
-            vbox.posToRobot[2 * i] = -ox / fabs(ox) * VISION_LIMIT;
-            vbox.posToRobot[2 * i + 1] = -oy / fabs(oy) * VISION_LIMIT;
+            vbox.posToRobot[2 * i] = -std::copysign(VISION_LIMIT, ox);
+            vbox.posToRobot[2 * i + 1] = -std::copysign(VISION_LIMIT, oy);
         }
     }
 
@@ -3699,54 +3703,7 @@ void Brain::playSoundForFun() {
     }
 }
 
-// =============================================================================
-//  请将以下代码追加到 src/brain/src/brain.cpp 的最末尾 (在最后的 } 之后或者之前均可，确保在 namespace 外或类定义外)
-// =============================================================================
 
-/**
- * 计算当前向 dir 方向踢球的价值的大小.
- */
-double Brain::kickValue(double dir)
-{
-    // 简单的价值评估：如果是朝向对方球门方向，价值高
-    // 这里是一个基础实现，你可以根据策略需要修改
-    auto fd = config->fieldDimensions;
-    double goalDir = atan2(0.0 - data->robotPoseToField.y, fd.length/2.0 - data->robotPoseToField.x);
-    double diff = fabs(toPInPI(dir - goalDir));
-    
-    // 角度偏差越小，价值越高。范围 [0, 1]
-    return max(0.0, 1.0 - diff / M_PI); 
-}
-
-/**
- * 计算当前的急迫度
- * 0: 安全, 1: 有威胁, 2: 危险
- */
-double Brain::threatLevel()
-{
-    // 基础实现：如果有敌人在附近(2米内)，则认为有威胁
-    double minOpponentDist = 100.0;
-    auto robots = data->getRobots();
-    for(const auto& r : robots) {
-        if(r.label == "Opponent") {
-            double dist = r.range;
-            if(dist < minOpponentDist) minOpponentDist = dist;
-        }
-    }
-
-    if (minOpponentDist < 1.0) return 2.0;
-    if (minOpponentDist < 2.5) return 1.0;
-    return 0.0;
-}
-
-/**
- * 判断是否适合定向踢球
- */
-bool Brain::isAngleGoodForDirectionalKick(double goalPostMargin)
-{
-    // 复用通用的角度判断逻辑，或者添加特定逻辑
-    return isAngleGood(goalPostMargin, "kick");
-}
 
 /**
  * 检查前方扇形区域是否有障碍物

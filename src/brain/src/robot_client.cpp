@@ -184,7 +184,7 @@ int RobotClient::squatUp()
 int RobotClient::RLVisionKick(bool start)
 {
     if (start) {
-        if (!brain->isKickAllowed() || !brain->hasFreshLocalBall() || brain->data->kickoffGuardActive) return -1;
+        if (!brain->isVisualKickAllowed() || !brain->hasFreshLocalBall()) return -1;
         if (_visualKickActive) return 0;
     } else if (!_visualKickActive) {
         return 0;

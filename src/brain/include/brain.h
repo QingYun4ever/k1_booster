@@ -21,6 +21,7 @@
 #include "match_policy.h"
 #include "team_strategy.h"
 #include "tactical_timing.h"
+#include "tactical_kick.h"
 
 #include "booster_interface/msg/odometer.hpp"
 #include "booster_interface/msg/low_state.hpp"
@@ -95,36 +96,12 @@ public:
     bool isMotionAllowed() const;
     bool isRecoveryAllowed() const;
     bool isKickAllowed() const;
+    bool isVisualKickAllowed() const;
+    bool isGroundKickAllowed() const;
     bool hasFreshLocalBall(double maxAgeMs = 650.0) const;
 
     // 处理特殊状态, 如发球状态, 任意球发球状态等
     void handleSpecialStates();
-
-    /**
-     * @brief 计算当前球到对方两个球门柱的向量角度, 球场坐标系
-     *
-     * @param  margin double, 计算角度时, 返回值比实际的球门的位置向内移动这个距离, 因为这个角度球会被门柱挡住. 此值越大, 射门准确性越高, 但调整角度花的时间也越长.
-     *
-     * @return vector<double> 返回值中 vec[0] 是左门柱, vec[1] 是右门柱. 注意左右都是以对方的方向为前方.
-     */
-    vector<double> getGoalPostAngles(const double margin = 0.3);
-
-    // 弃用. use CalcKickDir Node instead. 根据球与机器人的位置, 计算踢向对方球门的角度, 使得机器人可以以最少的位置调整达到此角度. goalPostMargin 代表计算角度时, 将门柱周围多少距离让出来, 以防止方向撞到门柱
-    double calcKickDir(double goalPostMargin = 0.3);
-
-    // 计算当前机器人与球之间的角度, 如果射门, 是否可以成功. goalPostMargin 代表计算角度时, 将门柱周围多少距离让出来, 以防止方向撞到门柱;
-    // type: kick: 趟球, shoot: rl 踢球
-    bool isAngleGood(double goalPostMargin = 0.3, string type = "kick");
-    bool isAngleGoodForDirectionalKick(double goalPostMargin = 0.3);
-
-    // 当前位置是否可以大力开球
-    bool isPositionGoodForPowerShoot();
-
-    // 计算当前向 dir 方向踢球的价值的大小.
-    double kickValue(double dir);
-
-    // 计算当前的急迫度, 没看见敌人: 0, 看见敌人, 但距离远: 1, 看见敌人, 距离近: 2
-    double threatLevel();
 
     // 判断当前球是否在界外
     bool isBallOut(double locCompareDist = 3.0, double lineCompareDist = 1.0);
@@ -141,6 +118,7 @@ public:
     // 根据配置返回追球使用的球；预测无效或关闭时自动回退到原始球
     GameObject getBallForChase() const;
     tactics::World getTacticalWorld() const;
+    void updateKickPlan();
 
     // Publish a lightweight JSON snapshot for the local WebUI bridge.
     void publishWebuiStatus();

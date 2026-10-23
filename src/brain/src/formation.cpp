@@ -273,7 +273,7 @@ FormationResult FormationPlanner::assign(const FormationInput &in, bool assignBy
     res.slotName = slots[mySlot].name;
     res.target = slots[mySlot].pose;
 
-    // 进攻场景: 给出开球第一脚小传球目标 (供开球者的 CalcKickDir 在 kickoff_guard 期间使用)
+    // 进攻场景: 给出开球第一脚小传球目标 (供 updateKickPlan 在 kickoff_guard 期间使用)
     if (in.scene == "kickoff_attack") {
         bool found = false;
         for (auto &s : slots) {

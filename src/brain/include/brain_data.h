@@ -12,6 +12,7 @@
 #include "types.h"
 #include "RoboCupGameControlData.h"
 #include "buffer.h"
+#include "tactical_types.h"
 
 using namespace std;
 
@@ -58,7 +59,7 @@ public:
     rclcpp::Time kickoffGuardWindowStart; // 开球窗口起点 (摆位期间持续刷新, 进入比赛后开始 10s 倒计时)
     rclcpp::Time kickoffGuardLastObservation{0, 0, RCL_ROS_TIME};
 
-    // 站位 (方案任务4). 由 GoToFormationSlot 节点更新, CalcKickDir 消费.
+    // 站位 (方案任务4). 由 GoToFormationSlot 节点更新, updateKickPlan 消费.
     string formationSlotName = "";       // 本机当前被分配的槽位语义名 (passer/shooter/kicker/receiver/L1a/...); 空=未分配
     Pose2D formationPassTarget;          // 进攻开球场景的传球目标点 (field 系), 开球者第一脚小传球指向此处
     bool formationPassTargetValid = false;
@@ -159,7 +160,7 @@ public:
 
     // 运动规划
     double kickDir = 0.; // 在决策中规划的踢球方向, field 坐标系
-    string kickType = "shoot"; // "shoot" | "cross" | "block"
+    tactics::KickPlan tacticalKick;
     bool isDirectShoot = false; // 在直接任意球开球的时候, 这个值会为 true; 执行了踢球动作或超过规定时间, 这个值会被 handleSpecialStates 重置为 false
     Pose2D supportTarget{};
     string supportRole = "hold";
