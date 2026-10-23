@@ -872,6 +872,12 @@ string Brain::buildWebuiStatusJson() {
     oss << ",\"tm_my_cost\":";
     appendNumber(oss, data->tmMyCost);
     oss << ",\"tm_my_cost_rank\":" << data->tmMyCostRank;
+    oss << ",\"touch_costs_seconds\":[";
+    for (int i = 0; i < config->numOfPlayers; ++i) {
+        if (i) oss << ',';
+        appendNumber(oss, data->touchCosts[i]);
+    }
+    oss << ']';
     oss << "}";
 
     oss << ",\"pose\":{\"field\":";
@@ -1183,10 +1189,33 @@ void Brain::handleCooperation()
         }
     }
 
-    updateCostToKick();
     std::array<team_strategy::Candidate, team_strategy::kCapacity> candidates{};
     data->myStrikerIDRank = 0;
     const auto &fd = config->fieldDimensions;
+    auto commonWorld = getTacticalWorld();
+    std::array<tactics::BallSample, HL_MAX_NUM_PLAYERS> samples{};
+    tactics::Ball localSample = commonWorld.ball;
+    localSample.position = {data->ball.posToField.x, data->ball.posToField.y};
+    localSample.ageSeconds = msecsSince(data->ball.timePoint) / 1000.0;
+    localSample.confidence = data->ball.confidence;
+    samples[self] = {config->playerId, localSample, online[self] && hasFreshLocalBall()};
+    for (int i = 0; i < count; ++i) {
+        if (i == self) continue;
+        const auto &status = data->tmStatus[i];
+        tactics::Ball ball;
+        ball.position = {status.ballPosToField.x, status.ballPosToField.y};
+        ball.confidence = status.ballConfidence;
+        ball.ageSeconds = msecsSince(status.ballObservationTime) / 1000.0;
+        ball.known = status.ballDetected && status.ballLocationKnown;
+        samples[i] = {i + 1, ball, online[i]};
+    }
+    const auto commonBall = tactics::selectTeamBall(samples, count);
+    if (commonBall.known) commonWorld.ball = commonBall;
+    // Peers do not transmit velocity; shared ownership uses the same static source contract.
+    commonWorld.ball.velocityKnown = false;
+    // No shared opponent map exists yet; locally observed blockers cannot bias a peer-only election.
+    commonWorld.obstacleCount = 0;
+    const double contactDirection = tactics::angle(commonWorld.ball.position, {fd.length / 2.0, 0.0});
     for (int i = 0; i < count; ++i) {
         if (i < self && eligible[i] && i + 1 != goalie) ++data->myStrikerIDRank;
         const bool local = i == self;
@@ -1198,8 +1227,14 @@ void Brain::handleCooperation()
             msecsSince(status.ballObservationTime) >= 0.0 && msecsSince(status.ballObservationTime) <= 650.0;
         const bool goalieClaims = i + 1 == goalie && (inSkill ||
             (fresh && ballRange < 1.5 && ballField.x < -fd.length / 2.0 + fd.penaltyAreaLength));
+        const tactics::Pose pose = local ? commonWorld.robot : tactics::Pose{
+            status.robotPoseToField.x, status.robotPoseToField.y, status.robotPoseToField.theta};
+        const auto estimate = tactics::estimateTouch(commonWorld, pose, contactDirection);
+        const double cost = estimate.valid && estimate.reachable ? estimate.seconds : 100.0;
+        data->touchCosts[i] = cost;
+        if (local) data->tmMyCost = cost;
         candidates[i] = {i + 1, online[i] && (i + 1 != goalie || goalieClaims), inSkill,
-            local ? data->tmImLead : status.isLead, local ? data->tmMyCost : status.cost};
+            local ? data->tmImLead : status.isLead, cost};
     }
     data->ballOwnerId = isMotionAllowed() ? team_strategy::owner(candidates, count,
         get_parameter("strategy.cooperation.owner_switch_margin").as_double()) : 0;
@@ -1420,25 +1455,62 @@ double Brain::calcKickDir(double goalPostMargin) {
     return theta_r;
 }
 
-void Brain::updateCostToKick()
+tactics::World Brain::getTacticalWorld() const
 {
+    tactics::World world;
+    const auto &fd = config->fieldDimensions;
+    world.field = {fd.length, fd.width, fd.goalWidth, fd.penaltyAreaLength, fd.penaltyAreaWidth};
+    world.limits = {std::min(config->vxLimit, 0.9), std::min(config->vyLimit, 0.2), std::min(config->vthetaLimit, 1.0)};
+    const auto &pose = data->robotPoseToField;
+    world.robot = {pose.x, pose.y, pose.theta};
     const auto ball = getBallForChase();
-    const bool known = tree->getEntry<bool>("ball_location_known") || tree->getEntry<bool>("tm_ball_pos_reliable");
-    if (!known || !std::isfinite(ball.range) || !std::isfinite(ball.yawToRobot) ||
-        !std::isfinite(data->kickDir)) {
-        // Searching players still get a finite, deterministic owner rather than NaN.
-        data->tmMyCost = 100.0;
-        return;
+    world.ball.position = {ball.posToField.x, ball.posToField.y};
+    world.ball.ageSeconds = msecsSince(ball.timePoint) / 1000.0;
+    world.ball.confidence = ball.confidence;
+    world.ball.known = tree->getEntry<bool>("odom_calibrated") &&
+        (tree->getEntry<bool>("ball_location_known") || tree->getEntry<bool>("tm_ball_pos_reliable"));
+    world.viewReliable = tree->getEntry<bool>("odom_calibrated") && hasFreshLocalBall();
+    const double predictionAge = msecsSince(data->ballPosPredictTime);
+    world.ball.velocityKnown = data->ballPredictionValid && !data->ballPredictionPredictedOnly &&
+        hasFreshLocalBall() && predictionAge >= 0.0 && predictionAge <= 300.0;
+    world.ball.velocity = {data->ballVelocityToField.x, data->ballVelocityToField.y};
+    const int owner = data->ballOwnerId - 1;
+    if (owner == config->playerId - 1 && data->tmImAlive) {
+        world.owner = world.robot;
+        world.ownerKnown = true;
+        world.ownerControlling = data->tmImInVisualKick || (hasFreshLocalBall() && data->ball.range < 1.0);
+    } else if (owner >= 0 && owner < config->numOfPlayers) {
+        const auto &status = data->tmStatus[owner];
+        const double age = msecsSince(status.timeLastCom);
+        if (status.isAlive && age >= 0.0 && age <= 2200.0) {
+            world.owner = {status.robotPoseToField.x, status.robotPoseToField.y, status.robotPoseToField.theta};
+            world.ownerKnown = true;
+            world.ownerControlling = status.isInVisualKick || (status.ballDetected && status.ballRange < 1.0 &&
+                msecsSince(status.ballObservationTime) >= 0.0 && msecsSince(status.ballObservationTime) <= 650.0);
+        }
     }
-    const double ageSeconds = std::clamp(msecsSince(ball.timePoint) / 1000.0, 0.0, 3.0);
-    double cost = ball.range + ageSeconds + fabs(ball.yawToRobot) +
-        fabs(toPInPI(data->kickDir - atan2(ball.posToField.y - data->robotPoseToField.y,
-            ball.posToField.x - data->robotPoseToField.x))) * 0.4 / 0.3;
-    if (distToObstacle(ball.yawToRobot) < 1.5) cost += 0.5;
-    if (data->recoveryState != RobotRecoveryState::IS_READY) cost += 15.0;
-    if (!tree->getEntry<bool>("odom_calibrated")) cost += 100.0;
-    data->tmMyCost = std::isfinite(cost) ? std::max(0.0, cost) : 100.0;
+    for (const auto &object : data->getRobots()) {
+        const double age = msecsSince(object.timePoint);
+        if (age < 0.0 || age > 1000.0 || object.confidence < 50.0 || world.obstacleCount == tactics::kMaxObstacles) continue;
+        const tactics::Point position{object.posToField.x, object.posToField.y};
+        if (!tactics::finite(position)) continue;
+        world.obstacles[world.obstacleCount++] = {position, 0.4 + age * 0.0002, object.label == "Opponent"};
+    }
+    for (int i = 0; i < config->numOfPlayers && world.obstacleCount < tactics::kMaxObstacles; ++i) {
+        if (i == config->playerId - 1) continue;
+        const auto &status = data->tmStatus[i];
+        const double age = msecsSince(status.timeLastCom);
+        if (!status.isAlive || age < 0.0 || age > 1000.0) continue;
+        const tactics::Point position{status.robotPoseToField.x, status.robotPoseToField.y};
+        if (tactics::finite(position)) world.obstacles[world.obstacleCount++] = {position, 0.45, false};
+    }
+    for (const auto &post : data->getGoalposts()) {
+        const double age = msecsSince(post.timePoint);
+        if (post.posToField.x > 0.0 && age >= 0.0 && age <= 650.0 && post.confidence >= 50.0) world.goalObserved = true;
+    }
+    return world;
 }
+
 
 bool Brain::isAngleGood(double goalPostMargin, string type) {
     double angle = 0;
@@ -1714,7 +1786,7 @@ void Brain::speak(string text, bool allowRepeat)
     _lastText = text;
 }
 
-double Brain::msecsSince(rclcpp::Time time)
+double Brain::msecsSince(rclcpp::Time time) const
 {
     auto now = this->get_clock()->now();
     if (time.get_clock_type() != now.get_clock_type()) return 1e18;

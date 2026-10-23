@@ -20,6 +20,7 @@
 #include <k1_teammate_ball/teammate_ball_sharing.hpp>
 #include "match_policy.h"
 #include "team_strategy.h"
+#include "tactical_timing.h"
 
 #include "booster_interface/msg/odometer.hpp"
 #include "booster_interface/msg/low_state.hpp"
@@ -139,6 +140,7 @@ public:
 
     // 根据配置返回追球使用的球；预测无效或关闭时自动回退到原始球
     GameObject getBallForChase() const;
+    tactics::World getTacticalWorld() const;
 
     // Publish a lightweight JSON snapshot for the local WebUI bridge.
     void publishWebuiStatus();
@@ -156,7 +158,7 @@ public:
     // 根据真值校准 odom. 参数 x, y, theta 代表在球场坐标系的机器人的 Pose 真值
     void calibrateOdom(double x, double y, double theta);
 
-    double msecsSince(rclcpp::Time time);
+    double msecsSince(rclcpp::Time time) const;
 
     bool isFreekickStartPlacing();
 
@@ -177,8 +179,6 @@ public:
 
     bool isPrimaryStriker();
 
-    // 计算当前踢球的成本, 用于多机配合时决定由谁来控制球
-    void updateCostToKick();
 
 
 

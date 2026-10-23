@@ -171,6 +171,7 @@ public:
     int tmMyCostRank = 0; // 我接近球的成本排名, 用于多机配合. 基本上 cost 相当于我踢到球需要花的秒数.
     int myStrikerIDRank = 0; // 我的 ID 在前锋中的排名, 用于多机配合. 
     int ballOwnerId = 0;
+    std::array<double, HL_MAX_NUM_PLAYERS> touchCosts{};
     bool tmImInVisualKick = false; // 自己是否处于 visual kick 模式
     bool shouldExitRLVisionKick = false; // 是否需要主动退出 visual kick 模式
 

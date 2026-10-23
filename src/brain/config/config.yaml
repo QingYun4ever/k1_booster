@@ -107,7 +107,7 @@ brain_node:
       auto_visual_kick_enable_dist_max: 4.0
       auto_visual_kick_enable_angle: 0.8
       cooperation:
-        owner_switch_margin: 0.3 # Retain one confirmed owner unless another is clearly cheaper
+        owner_switch_margin: 0.3 # Seconds of touch-time advantage required to replace one owner
 
       role_assignment:
         gk_takeover: true # GC penalized goalkeeper -> smallest eligible ID; no active handover
